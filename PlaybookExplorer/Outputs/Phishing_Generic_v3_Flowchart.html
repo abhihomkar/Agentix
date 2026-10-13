@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phishing - Generic v3 Playbook Flowchart</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.0/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f2f5;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+            padding: 30px;
+        }
+        h1 {
+            color: #007bff;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2em;
+            font-weight: 600;
+        }
+        .mermaid-chart {
+            background-color: #f9f9f9;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 20px;
+            text-align: center;
+            overflow-x: auto;
+        }
+        .mermaid {
+            margin: 0 auto;
+            max-width: 100%;
+        }
+        /* Mermaid theme customization for Palo Alto Networks look and feel */
+        .mermaid .node rect, .mermaid .node circle, .mermaid .node polygon {
+            fill: #e6f2ff; /* Light blue background for nodes */
+            stroke: #007bff; /* Blue border */
+            stroke-width: 1.5px;
+        }
+        .mermaid .node.current rect, .mermaid .node.current circle, .mermaid .node.current polygon {
+            fill: #d0e7ff; /* Slightly darker blue for current/highlighted */
+        }
+        .mermaid .node text {
+            fill: #333; /* Dark text */
+            font-weight: 500;
+        }
+        .mermaid .edgePath .path {
+            stroke: #666; /* Darker grey for arrows */
+            stroke-width: 1.5px;
+        }
+        .mermaid .edgeLabel text {
+            fill: #555; /* Edge label text */
+        }
+        .mermaid .cluster rect {
+            fill: #f0f5f9; /* Light grey for subgraphs */
+            stroke: #a0b0c0;
+            stroke-width: 1px;
+        }
+        .mermaid .cluster text {
+            fill: #444;
+            font-weight: 600;
+        }
+        .mermaid .flowchart-label {
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Phishing - Generic v3 Playbook Flowchart</h1>
+        <div class="mermaid-chart">
+            <pre class="mermaid">
+                flowchart TD
+                    subgraph Initial Setup
+                        A[Start] --> B(Start Detection Timer)
+                        B --> C{Was reporter specified?}
+                        B --> D(Set Listener Mailbox)
+                        C -- No --> E(Save reporter email address)
+                        C -- No - Manual --> F(Triage)
+                        C -- Yes --> G(Reporter Address specified)
+                        E --> F
+                        D --> F
+                        G --> F
+                    end
+
+                    subgraph Core Processing
+                        F --> H(Process Email - Generic v2)
+                        G --> I(Engage with User)
+                        I --> J{Engage with the user?}
+                        J -- yes --> K(Email Address Enrichment - Generic v2.1)
+                        J -- else --> L(Investigation)
+                        K --> L
+                    end
+
+                    subgraph Analysis & Enrichment
+                        H --> M(Extract Indicators From File)
+                        H --> N(Detonate File - Generic)
+                        H --> O(Machine Learning Analysis)
+                        H --> P{Detonate URL?}
+                        P -- yes --> Q(Detonate URL - Generic v1.5)
+                        Q --> R(Indicator Enrichment)
+                        N --> R
+                        M --> S{Was a file with macro found?}
+                        S -- yes --> T(Set Macro Source Code field)
+                        S -- else --> R
+                        T --> R
+                        O --> U(Calculate Severity - Generic v2)
+                        R --> L
+                        L --> V(Email Campaign Search)
+                        L --> W(Email Authenticity Check)
+                        L --> X(Microsoft's Headers Check)
+                        L --> Y(Spear Phishing)
+                        L --> Z(Email Indicators Hunting)
+                        L --> AA(Threat Intelligence Analysis)
+                        V --> U
+                        W --> AB{Should email be authenticated?}
+                        AB -- yes --> AC(Authenticate email)
+                        AC --> AD(Save authenticity check result)
+                        AD --> U
+                        AB -- else --> U
+                        X --> AE{Check Microsoft's Headers?}
+                        AE -- yes --> AF(Process Anti-Spam Headers)
+                        AF --> U
+                        AE -- else --> U
+                        Y --> U
+                        Z --> AG{Hunt email indicators?}
+                        AG -- yes --> AH(Phishing - Indicators Hunting)
+                        AH --> U
+                        AG -- else --> U
+                        AA --> AI(TIM - Indicator Relationships Analysis)
+                        AI --> AJ{Alert indicators related to campaign/report from TIM?}
+                        AJ -- yes --> AK(Set Threat Intel findings to layout)
+                        AK --> U
+                        AJ -- else --> U
+                    end
+
+                    subgraph Verdict & User Communication
+                        U --> AL(Assign to analyst)
+                        AL --> AM{Is the email malicious?}
+                        AM -- Malicious --> AN(Email Is Malicious)
+                        AM -- else --> AO(Undetermined)
+                        AN --> AP{Phishing email sender address exist?}
+                        AP -- yes --> AQ(Set sender verdict as malicious)
+                        AQ --> AR{Can the user be informed?}
+                        AP -- else --> AR
+                        AR -- yes - phishing --> AS(Update user: email is malicious)
+                        AR -- yes - phishing campaign --> AT(Update user: email is malicious campaign)
+                        AR -- else --> AU(Remediation)
+                        AS --> AU
+                        AT --> AU
+                        AO --> AV{Should be reviewed by analyst?}
+                        AV -- yes --> AW(Manually review the alert)
+                        AW --> AX{Is the email malicious?}
+                        AX -- No --> AY(Email Is Benign)
+                        AX -- yes --> AN
+                        AV -- else --> AY
+                        AY --> AZ{Can the user be informed?}
+                        AZ -- Yes --> BA(Update user: email is safe)
+                        AZ -- else --> BB{Pause for manual actions?}
+                        BA --> BB
+                    end
+
+                    subgraph Remediation & Closure
+                        AU --> BC(Block Indicators)
+                        AU --> BD(Search & Delete Email)
+                        BB -- yes --> BE(Take manual actions)
+                        BB -- else --> BF(Close investigation)
+                        BE --> BF
+                        BC --> BG{Automatically block indicators?}
+                        BG -- yes --> BH(Block Indicators - Generic v3)
+                        BG -- else --> BI(Set all indicators to semi-automated block options)
+                        BI --> BH
+                        BH --> BJ(Stop Remediation Timer)
+                        BD --> BK{Should emails be searched and deleted?}
+                        BK -- Yes --> BL{Check if original email was retrieved?}
+                        BL -- yes --> BM(Search And Delete Emails - Generic v2)
+                        BM --> BJ
+                        BL -- else --> BN(Manually search & delete emails)
+                        BN --> BJ
+                        BK -- else --> BN
+                        BJ --> BB
+                        BF --> C_END(Done)
+                    end
+            </pre>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'base', // Using 'base' theme to apply custom styles
+            themeVariables: {
+                // Custom theme variables can be added here if needed,
+                // but most styling is done via CSS for better control.
+            },
+            flowchart: {
+                curve: 'basis', // Makes connections smoother
+                htmlLabels: true
+            }
+        });
+    </script>
+</body>
+</html>
