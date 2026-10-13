@@ -1,0 +1,1076 @@
+commonfields:
+  id: 168448b6-fe84-4472-95d3-f4dc3ca9ff9b
+  version: -1
+vcShouldKeepItemLegacyProdMachine: false
+name: CreateFile
+script: |
+  register_module_line('CreateFile', 'start', __line__())
+
+  """
+  CreateFile
+  ==========
+
+  Creates a file from text content and returns it as a file entry in the war room
+  the script runs in - as-is, or converted to PDF or DOCX. Built for AgentiX
+  agents: the agent sends the Markdown / HTML / text / CSV / JSON / SVG it wrote,
+  or a Mermaid / draw.io / Excalidraw diagram, and gets the file back with its
+  file ID (CreateFile.FileID) in the result. To put the file in a case (incident)
+  or issue (alert) war room, pass that file ID as entryID to an upload action (a
+  duplicate of the OOTB UploadFile script).
+
+  XSIAM does not let one script both create a file and upload it, so creating
+  and delivering are two steps: this script, then the upload.
+
+  Flow: content -> blocks (headings, paragraphs, lists, tables, code)
+  -> output: as-is | html | md | txt | csv | json | svg | docx (built here, no library)
+                                                        | pdf  (nested GeneratePDF on demisto/chromium)
+     diagrams (mermaid / drawio / excalidraw) -> a page that draws them with the diagram's own
+     library from a CDN -> html, or pdf through GeneratePDF (which waits for window.__pdfReady)
+  -> one file entry returned from this run; the platform writes it to the war
+     room and sets File.EntryID / Name / Size / SHA256 / Type / Extension / Info.
+
+  Arguments
+  ---------
+  ``Content``         Required. The text to turn into a file.
+  ``InputFormat``     auto (default), markdown, html, text, csv, json, svg, mermaid, drawio, excalidraw or base64.
+                      Mermaid is repaired first (clean_mermaid): agents often send it escaped or wrapped.
+  ``OutputFormat``    same (default: the input as-is), pdf, docx, html, md, txt, csv, json or svg.
+  ``FileName``        Name of the file; the extension is set from OutputFormat. Default report.
+  ``Title``           Document title for pdf / docx / html (skipped when the content opens with its own h1).
+  ``Theme`` / ``PageSize`` / ``Orientation`` / ``IncludeTOC``  PDF options passed to GeneratePDF.
+  ``PdfScript``       Script that renders PDFs. Default GeneratePDF.
+  ``Unescape``        auto (default), true or false: undo the JSON escaping agents add (see unescape_content).
+
+  Outputs
+  -------
+  ``CreateFile`` - FileID (the entryID for the upload action), FileName, Format, SizeBytes.
+  ``File`` - set by the platform for the returned entry: EntryID, Name, Size, SHA256, Type, Extension, Info.
+
+  LLMs cannot write reliable binary. Binary formats (pdf, docx) are always built
+  here from text; InputFormat=base64 exists only for small payloads copied from
+  another action's output.
+  """
+
+  import base64
+  import csv
+  import html
+  import io
+  import json
+  import re
+  import traceback
+  import zipfile
+  from html.parser import HTMLParser
+  from typing import Any, Dict, List, Optional, Tuple
+
+  SCRIPT_NAME = 'CreateFile'
+  INPUT_FORMATS = ('auto', 'markdown', 'html', 'text', 'csv', 'json', 'svg', 'mermaid', 'drawio', 'excalidraw', 'base64')
+  OUTPUT_FORMATS = ('same', 'pdf', 'docx', 'html', 'md', 'txt', 'csv', 'json', 'svg')
+  DIAGRAM_FORMATS = ('mermaid', 'drawio', 'excalidraw')
+  EXTENSIONS = {'markdown': 'md', 'html': 'html', 'text': 'txt', 'csv': 'csv', 'json': 'json', 'svg': 'svg', 'base64': 'bin',
+                'pdf': 'pdf', 'docx': 'docx', 'md': 'md', 'txt': 'txt',
+                'mermaid': 'mmd', 'drawio': 'drawio', 'excalidraw': 'excalidraw'}
+  EXTENSION_RE = r'\.(?:[A-Za-z0-9]{1,5}|drawio|excalidraw)$'
+
+  # Diagram libraries, loaded by the browser that draws the page (GeneratePDF's headless Chrome, or the
+  # analyst's browser for html output). Pinned versions; the rendering host needs to reach these CDNs.
+  MERMAID_JS = 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs'
+  DRAWIO_JS = 'https://viewer.diagrams.net/js/viewer-static.min.js'
+  EXCALIDRAW_JS = 'https://esm.sh/@excalidraw/utils@0.1.2'
+  DIAGRAM_WAIT_MS = 30000  # stop waiting for a library that never loads; the page then shows why
+  MERMAID_KEYWORDS = (
+      r'(?:graph|flowchart|sequenceDiagram|classDiagram(?:-v2)?|stateDiagram(?:-v2)?|erDiagram|journey|gantt|pie|'
+      r'quadrantChart|requirementDiagram|gitGraph|C4Context|C4Container|C4Component|C4Dynamic|C4Deployment|mindmap|'
+      r'timeline|sankey-beta|xychart-beta|block-beta|packet-beta|kanban|architecture-beta|radar-beta)\b')
+  MERMAID_START = re.compile(r'^(?:%%[^\n]*\n\s*)*(?:---\n.*?\n---\s*\n\s*)?' + MERMAID_KEYWORDS, re.S)
+  # Content an agent JSON-escaped once too often (see unescape_content)
+  UNESCAPE_MODES = ('auto', 'true', 'false')
+  JSON_ESCAPE_RE = re.compile(r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])')
+  JSON_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r', '"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f'}
+  # A literal \n where a document line break belongs - after a tag, before indentation, a blank line, a Markdown
+  # block - as opposed to a "a\nb" string inside minified code
+  ESCAPED_BREAK_RE = re.compile(r'>\\n|\\n\s*<|\\n(?: {2,}|\\t)|\\n\\n|\\n[#*|>-]')
+  DOC_START = r'(?:<|#|---|```|%%|' + MERMAID_KEYWORDS + r')'
+  LEADING_JUNK_RE = re.compile(r'^[\[\]"\'“”,\s]+(?=' + DOC_START + r')')
+  # Agent-written Mermaid repairs (see clean_mermaid)
+  MERMAID_EMPTY_LABEL = re.compile(r'([\[({])\s*(?:""|“”|\'\')\s*([\])}])')        # T0[""] is a parse error
+  MERMAID_SINGLE_QUOTED = re.compile(r"([\[({]+)'([^'\n]*)'([\])}]+)")  # ' is not a quote: T0['a (b)'] fails
+  MERMAID_QUOTED_NODE = re.compile(r'^(\s*[\w.-]+\s*)([\[({]+)"(.*)"([\])}]+)\s*;?\s*$')
+
+  # A block is (kind, payload): ('heading', (level, runs)), ('para', runs), ('list', (ordered, [(level, runs)])),
+  # ('table', [[runs, ...], ...]) with the first row as header, ('code', text), ('hr', None).
+  # Runs are [(text, {'b', 'i', 'code', 'href'})] - inline formatting kept for docx and html.
+  Run = Tuple[str, Dict[str, Any]]
+
+
+  # ------------------------------------------------------------------ input parsing
+  INLINE_MD = re.compile(r'(\*\*(?P<b>.+?)\*\*|__(?P<b2>.+?)__|`(?P<code>[^`]+)`|\[(?P<lt>[^\]]+)\]\((?P<href>[^)\s]+)\)'
+                         r'|(?<![\w*])\*(?P<i>[^*\n]+)\*(?!\w)|(?<![\w_])_(?P<i2>[^_\n]+)_(?!\w))')
+
+
+  def md_runs(text: str) -> List[Run]:
+      """Inline Markdown -> runs: **bold**, *italic*, `code`, [text](url)."""
+      runs: List[Run] = []
+      pos = 0
+      for m in INLINE_MD.finditer(text):
+          if m.start() > pos:
+              runs.append((text[pos:m.start()], {}))
+          if m.group('b') or m.group('b2'):
+              runs.append((m.group('b') or m.group('b2'), {'b': True}))
+          elif m.group('code'):
+              runs.append((m.group('code'), {'code': True}))
+          elif m.group('lt'):
+              runs.append((m.group('lt'), {'href': m.group('href')}))
+          else:
+              runs.append((m.group('i') or m.group('i2'), {'i': True}))
+          pos = m.end()
+      if pos < len(text):
+          runs.append((text[pos:], {}))
+      return runs or [('', {})]
+
+
+  def split_row(line: str) -> List[str]:
+      line = line.strip()
+      if line.startswith('|'):
+          line = line[1:]
+      if line.endswith('|'):
+          line = line[:-1]
+      return [c.strip() for c in line.split('|')]
+
+
+  def markdown_blocks(text: str) -> List[Tuple[str, Any]]:
+      """Markdown -> blocks. Covers what agents write: headings, lists, pipe tables, fences, rules, paragraphs."""
+      blocks: List[Tuple[str, Any]] = []
+      lines = text.replace('\r\n', '\n').split('\n')
+      i, para = 0, []
+
+      def flush() -> None:
+          if para:
+              blocks.append(('para', md_runs(' '.join(p.strip() for p in para))))
+              para.clear()
+
+      while i < len(lines):
+          line = lines[i]
+          stripped = line.strip()
+          if stripped.startswith('```'):
+              flush()
+              code, i = [], i + 1
+              while i < len(lines) and not lines[i].strip().startswith('```'):
+                  code.append(lines[i])
+                  i += 1
+              blocks.append(('code', '\n'.join(code)))
+          elif re.match(r'^#{1,6}\s', stripped):
+              flush()
+              level = len(stripped) - len(stripped.lstrip('#'))
+              blocks.append(('heading', (level, md_runs(stripped[level:].strip().rstrip('#').strip()))))
+          elif re.match(r'^(-{3,}|\*{3,}|_{3,})$', stripped):
+              flush()
+              blocks.append(('hr', None))
+          elif stripped.startswith('|') and i + 1 < len(lines) and re.match(r'^\|?\s*:?-{2,}', lines[i + 1].strip()):
+              flush()
+              rows = [[md_runs(c) for c in split_row(line)]]
+              i += 2
+              while i < len(lines) and lines[i].strip().startswith('|'):
+                  rows.append([md_runs(c) for c in split_row(lines[i])])
+                  i += 1
+              blocks.append(('table', rows))
+              continue
+          elif re.match(r'^\s*([-*+]|\d+[.)])\s+', line):
+              flush()
+              ordered = bool(re.match(r'^\s*\d+[.)]', line))
+              items = []
+              while i < len(lines) and re.match(r'^\s*([-*+]|\d+[.)])\s+', lines[i]):
+                  indent = len(lines[i]) - len(lines[i].lstrip())
+                  body = re.sub(r'^\s*([-*+]|\d+[.)])\s+', '', lines[i])
+                  body = re.sub(r'^\[( |x|X)\]\s+', lambda m: '[x] ' if m.group(1) != ' ' else '[ ] ', body)
+                  items.append((indent // 2, md_runs(body)))
+                  i += 1
+              blocks.append(('list', (ordered, items)))
+              continue
+          elif stripped.startswith('>'):
+              flush()
+              blocks.append(('para', [('', {})] + md_runs(stripped.lstrip('> ').strip())))
+          elif not stripped:
+              flush()
+          else:
+              para.append(line)
+          i += 1
+      flush()
+      return blocks
+
+
+  def trim_runs(runs: List[Run]) -> List[Run]:
+      """Strip whitespace from the start of the first run and the end of the last one."""
+      runs = [r for r in runs if r[0]]
+      if runs:
+          runs[0] = (runs[0][0].lstrip(), runs[0][1])
+          runs[-1] = (runs[-1][0].rstrip(), runs[-1][1])
+      return runs
+
+
+  def starts_with_h1(blocks: List[Tuple[str, Any]]) -> bool:
+      """True when the content opens with its own level-1 heading, so a Title would only repeat it."""
+      return bool(blocks) and blocks[0][0] == 'heading' and blocks[0][1][0] == 1
+
+
+  SCRIPT_TAGS = re.compile(r'<script\b[^>]*>.*?</script\s*>|<script\b[^>]*/>', re.I | re.S)
+  EVENT_ATTRS = re.compile(r'\s+on[a-z]+\s*=\s*("[^"]*"|\'[^\']*\'|[^\s>]+)', re.I)
+
+
+  def strip_active_content(text: str) -> str:
+      """Remove <script> blocks and on*= handlers: a document needs neither, and an alert() dialog blocks
+      headless Chrome, so GeneratePDF would wait until its timeout."""
+      return EVENT_ATTRS.sub('', SCRIPT_TAGS.sub('', text))
+
+
+  class _HtmlBlocks(HTMLParser):
+      """HTML -> blocks. Block tags start new blocks; inline tags set run formatting; scripts/styles are dropped."""
+      SKIP = {'script', 'style', 'head', 'title', 'noscript'}
+      BLOCK = {'p', 'div', 'section', 'article', 'header', 'footer', 'main', 'blockquote', 'figure', 'figcaption',
+               'dd', 'dt', 'address', 'body', 'html'}
+
+      def __init__(self) -> None:
+          super().__init__(convert_charrefs=True)
+          self.blocks: List[Tuple[str, Any]] = []
+          self.runs: List[Run] = []
+          self.fmt: Dict[str, Any] = {}
+          self.stack: List[str] = []
+          self.skip = 0
+          self.heading = 0
+          self.lists: List[Tuple[bool, list]] = []
+          self.table: Optional[list] = None
+          self.row: Optional[list] = None
+          self.pre: Optional[List[str]] = None
+
+      def _flush(self) -> None:
+          text = ''.join(t for t, _ in self.runs).strip()
+          if text:
+              runs = trim_runs(self.runs)
+              if self.heading:
+                  self.blocks.append(('heading', (self.heading, runs)))
+              elif self.lists:
+                  self.lists[-1][1].append((len(self.lists) - 1, runs))
+              else:
+                  self.blocks.append(('para', runs))
+          self.runs = []
+
+      def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+          a = dict(attrs)
+          if tag in self.SKIP or (tag == 'svg' and not self.skip):
+              if tag == 'svg':  # a chart cannot live in docx / md / txt; say so instead of dumping its labels
+                  self._flush()
+                  label = a.get('aria-label') or a.get('title') or 'chart'
+                  self.blocks.append(('para', [(f'[{label} - see the PDF or HTML version]', {'i': True})]))
+              self.skip += 1
+              return
+          if self.skip:
+              if tag == 'svg':
+                  self.skip += 1
+              return
+          if tag == 'pre':
+              self._flush()
+              self.pre = []
+          elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+              self._flush()
+              self.heading = int(tag[1])
+          elif tag in ('ul', 'ol'):
+              self._flush()
+              self.lists.append((tag == 'ol', []))
+          elif tag == 'li':
+              self._flush()
+          elif tag == 'table':
+              self._flush()
+              self.table = []
+          elif tag == 'tr' and self.table is not None:
+              self.row = []
+          elif tag in ('td', 'th'):
+              self.runs = []
+          elif tag == 'br':
+              if self.pre is not None:
+                  self.pre.append('\n')
+              else:
+                  self.runs.append(('\n', dict(self.fmt)))
+          elif tag == 'hr':
+              self._flush()
+              self.blocks.append(('hr', None))
+          elif tag in self.BLOCK:
+              self._flush()
+          elif tag in ('b', 'strong'):
+              self.fmt['b'] = True
+          elif tag in ('i', 'em'):
+              self.fmt['i'] = True
+          elif tag == 'code':
+              self.fmt['code'] = True
+          elif tag == 'a' and a.get('href'):
+              self.fmt['href'] = a['href']
+          self.stack.append(tag)
+
+      def handle_endtag(self, tag: str) -> None:
+          if tag in self.SKIP or tag == 'svg':
+              self.skip = max(0, self.skip - 1)
+              return
+          if self.skip:
+              return
+          if tag == 'pre' and self.pre is not None:
+              self.blocks.append(('code', ''.join(self.pre).strip('\n')))
+              self.pre = None
+          elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+              self._flush()
+              self.heading = 0
+          elif tag in ('ul', 'ol') and self.lists:
+              self._flush()
+              ordered, items = self.lists.pop()
+              if self.lists:  # nested list: its items belong to the parent list
+                  self.lists[-1][1].extend(items)
+              elif items:
+                  self.blocks.append(('list', (ordered, items)))
+          elif tag == 'li':
+              self._flush()
+          elif tag in ('td', 'th') and self.row is not None:
+              self.row.append(self.runs or [('', {})])
+              self.runs = []
+          elif tag == 'tr' and self.table is not None and self.row is not None:
+              self.table.append(self.row)
+              self.row = None
+          elif tag == 'table' and self.table is not None:
+              if self.table:
+                  self.blocks.append(('table', self.table))
+              self.table = None
+          elif tag in self.BLOCK:
+              self._flush()
+          elif tag in ('b', 'strong'):
+              self.fmt.pop('b', None)
+          elif tag in ('i', 'em'):
+              self.fmt.pop('i', None)
+          elif tag == 'code':
+              self.fmt.pop('code', None)
+          elif tag == 'a':
+              self.fmt.pop('href', None)
+
+      def handle_data(self, data: str) -> None:
+          if self.skip:
+              return
+          if self.pre is not None:
+              self.pre.append(data)
+              return
+          text = re.sub(r'\s+', ' ', data)
+          if text.strip() or (self.runs and text == ' '):
+              self.runs.append((text, dict(self.fmt)))
+
+      def close(self) -> None:
+          super().close()
+          self._flush()
+
+
+  def html_blocks(text: str) -> List[Tuple[str, Any]]:
+      parser = _HtmlBlocks()
+      parser.feed(text)
+      parser.close()
+      return parser.blocks
+
+
+  def csv_blocks(text: str) -> List[Tuple[str, Any]]:
+      rows = [r for r in csv.reader(io.StringIO(text)) if r]
+      return [('table', [[[(c, {})] for c in r] for r in rows])] if rows else []
+
+
+  def json_blocks(text: str) -> List[Tuple[str, Any]]:
+      """A list of flat objects becomes a table; anything else becomes pretty-printed code."""
+      data = json.loads(text)
+      if isinstance(data, dict):
+          data = [data] if all(not isinstance(v, (dict, list)) for v in data.values()) else data
+      if isinstance(data, list) and data and all(isinstance(r, dict) for r in data):
+          cols = list(dict.fromkeys(k for r in data for k in r))
+          cell = lambda v: json.dumps(v) if isinstance(v, (dict, list)) else ('' if v is None else str(v))  # noqa: E731
+          return [('table', [[[(c, {})] for c in cols]] + [[[(cell(r.get(c)), {})] for c in cols] for r in data])]
+      return [('code', json.dumps(data, indent=2))]
+
+
+  def text_blocks(text: str) -> List[Tuple[str, Any]]:
+      return [('para', [(p.strip(), {})]) for p in re.split(r'\n\s*\n', text) if p.strip()]
+
+
+  def is_excalidraw(data: Any) -> bool:
+      """An Excalidraw scene: {"type": "excalidraw", "elements": [...]}, or just {"elements": [{"type": ..., "x": ...}]}."""
+      if not isinstance(data, dict) or not isinstance(data.get('elements'), list):
+          return False
+      return data.get('type') == 'excalidraw' or (
+          bool(data['elements']) and all(isinstance(e, dict) and 'type' in e and 'x' in e for e in data['elements']))
+
+
+  def unfence_mermaid(content: str) -> str:
+      """Content sent as a ```mermaid fenced block -> the diagram source inside it."""
+      m = re.match(r'^\s*```\s*mermaid\s*\n(.*?)\n\s*```\s*$', content, re.S | re.I)
+      return m.group(1) if m else content
+
+
+  def decode_json_escapes(text: str) -> str:
+      """Undo one level of JSON string escaping in a single pass: \\n -> line break, \\" -> ", \\\\n -> \\n."""
+      return JSON_ESCAPE_RE.sub(lambda m: chr(int(m.group(1)[1:], 16)) if m.group(1)[0] == 'u'
+                                else JSON_ESCAPES[m.group(1)], text)
+
+
+  def unwrap_json_text(text: str) -> Optional[str]:
+      """The document, when the whole content is a JSON string ("<html>...") or a list of its lines.
+
+      A list is only unwrapped when its first line opens a document, so a real JSON array of strings is kept.
+      """
+      if text[:1] not in '"[':
+          return None
+      try:
+          decoded = json.loads(text)
+      except ValueError:
+          return None
+      if isinstance(decoded, str):
+          return decoded
+      if (isinstance(decoded, list) and decoded and all(isinstance(line, str) for line in decoded)
+              and re.match(r'\s*' + DOC_START, decoded[0])):
+          return '\n'.join(decoded)
+      return None
+
+
+  def looks_escaped(text: str) -> bool:
+      """True when the whole content was JSON-escaped once too often, rather than containing a few literal \\n.
+
+      Needs at least two escaped line breaks with (almost) no real ones, at least one of them where a document
+      line break belongs, and content that is not valid JSON as it is (minified JSON has \\n inside its strings).
+      Escaped attribute quotes (=\\") with no plain ones (=") also count, for single-line markup.
+      """
+      breaks = sum(1 for m in JSON_ESCAPE_RE.finditer(text) if m.group(1) == 'n')
+      escaped_breaks = breaks >= 2 and text.count('\n') * 4 <= breaks and bool(ESCAPED_BREAK_RE.search(text))
+      escaped_attributes = '=\\"' in text and '="' not in text
+      if not (escaped_breaks or escaped_attributes):
+          return False
+      try:
+          json.loads(text)
+          return False
+      except ValueError:
+          return True
+
+
+  def strip_wrapper(text: str) -> str:
+      """Drop stray characters before the document start (e.g. [" or ,) and their unmatched closers at the end.
+
+      Closers go only while unmatched, so a document that really ends in ] or " (T9["Done"]) stays intact.
+      A wrapper always has a quote in it (["  "  [""]); without one (a Markdown link [<img ...>](...)) nothing goes.
+      """
+      junk = LEADING_JUNK_RE.match(text)
+      if not junk or not re.search('["“”\']', junk.group(0)):
+          return text
+      text = text[junk.end():].rstrip()
+      while True:
+          before = text
+          for opener, closer in (('[', ']'), ('“', '”')):
+              while text.endswith(closer) and text.count(closer) > text.count(opener):
+                  text = text[:-1].rstrip()
+          while text.endswith(',') or (text.endswith('"') and text.count('"') % 2):
+              text = text[:-1].rstrip()
+          if text == before:
+              return text
+
+
+  def unescape_content(content: str, mode: str = 'auto') -> str:
+      """Undo the escaping and wrapping agents add when they hand over a document as a JSON value.
+
+      mode auto: only when the content is clearly escaped as a whole (unwrap_json_text, looks_escaped) - legit
+      content, including literal \\n in code samples, passes through unchanged. true: always decode one level.
+      false: content is used exactly as given.
+      """
+      if mode == 'false':
+          return content
+      text = content.strip()
+      unwrapped = unwrap_json_text(text)
+      if unwrapped is not None:
+          text = unwrapped.strip()
+      elif mode == 'true' or looks_escaped(text):
+          text = decode_json_escapes(text).strip()
+      text = strip_wrapper(text)
+      return content if text == content.strip() else text
+
+
+  def clean_mermaid(content: str, unescape: str = 'auto') -> str:
+      """Repair the damage agents commonly do to Mermaid source, so it parses.
+
+      Each repair targets something Mermaid rejects; valid source passes through unchanged:
+      - a ```mermaid fence, the source sent as a JSON string / list of lines, escaped once too often (literal
+        \\n and \\"), or wrapped in stray characters - see unescape_content
+      - trailing commas after statements
+      - single-quoted labels, T0['Blocked (yes)'] -> T0["Blocked (yes)"] (Mermaid reads ' as text, so ( ) [ ] { }
+        inside such a label break the parse)
+      - empty labels, T0[""] -> T0[" "]
+      - quotes inside a quoted node label, A["Say "hi""] -> A["Say #quot;hi#quot;"]
+      """
+      text = unescape_content(unfence_mermaid(content.strip()), unescape)
+      if unescape != 'false':
+          text = text.replace('\\"', '"')  # never valid in Mermaid, even on a single line
+      text = unfence_mermaid(text.replace('\r\n', '\n').strip())
+
+      lines = []
+      for line in text.split('\n'):
+          line = line.rstrip()
+          if line.endswith(',') and line.count('"') % 2 == 0:
+              line = line.rstrip(',').rstrip()
+          line = MERMAID_SINGLE_QUOTED.sub(lambda m: f'{m.group(1)}"{m.group(2).replace(chr(34), "#quot;")}"{m.group(3)}',
+                                           line)
+          line = MERMAID_EMPTY_LABEL.sub(r'\1" "\2', line)
+          node = MERMAID_QUOTED_NODE.match(line)
+          if node and '"' in node.group(3) and not re.search(r'"\s*[\])}]|[\[({]\s*"|--|==', node.group(3)):
+              line = f'{node.group(1)}{node.group(2)}"{node.group(3).replace(chr(34), "#quot;")}"{node.group(4)}'
+          lines.append(line)
+      return '\n'.join(lines).strip()
+
+
+  def detect_format(content: str) -> str:
+      s = content.lstrip()
+      head = s[:600].lower()
+      if head.startswith('<svg') or (head.startswith('<?xml') and '<svg' in head):
+          return 'svg'
+      if re.match(r'^(?:<\?xml[^>]*>\s*)?<(?:mxfile|mxgraphmodel)\b', head):
+          return 'drawio'
+      if s.startswith('<'):
+          return 'html'
+      # Before JSON: an agent may send Mermaid as a JSON string or list ("flowchart ..." / ["flowchart ..."])
+      if MERMAID_START.match(clean_mermaid(s)):
+          return 'mermaid'
+      if s[:1] in '[{':
+          try:
+              return 'excalidraw' if is_excalidraw(json.loads(s)) else 'json'
+          except ValueError:
+              pass
+      return 'markdown'
+
+
+  def to_blocks(content: str, fmt: str) -> List[Tuple[str, Any]]:
+      return {'markdown': markdown_blocks, 'html': html_blocks, 'csv': csv_blocks, 'json': json_blocks,
+              'text': text_blocks}[fmt](content)
+
+
+  # ------------------------------------------------------------------ html output
+  def runs_html(runs: List[Run]) -> str:
+      out = []
+      for text, f in runs:
+          t = html.escape(text).replace('\n', '<br>')
+          if f.get('code'):
+              t = f'<code>{t}</code>'
+          if f.get('b'):
+              t = f'<strong>{t}</strong>'
+          if f.get('i'):
+              t = f'<em>{t}</em>'
+          if f.get('href'):
+              t = f'<a href="{html.escape(f["href"], quote=True)}">{t}</a>'
+          out.append(t)
+      return ''.join(out)
+
+
+  def blocks_html(blocks: List[Tuple[str, Any]], title: str) -> str:
+      body = [f'<h1>{html.escape(title)}</h1>'] if title and not starts_with_h1(blocks) else []
+      for kind, p in blocks:
+          if kind == 'heading':
+              body.append(f'<h{p[0]}>{runs_html(p[1])}</h{p[0]}>')
+          elif kind == 'para':
+              body.append(f'<p>{runs_html(p)}</p>')
+          elif kind == 'code':
+              body.append(f'<pre><code>{html.escape(p)}</code></pre>')
+          elif kind == 'hr':
+              body.append('<hr>')
+          elif kind == 'list':
+              tag = 'ol' if p[0] else 'ul'
+              body.append(f'<{tag}>' + ''.join(
+                  f'<li style="margin-left:{lvl * 1.5}em">{runs_html(r)}</li>' for lvl, r in p[1]) + f'</{tag}>')
+          elif kind == 'table':
+              head, *rest = p
+              body.append('<table><thead><tr>' + ''.join(f'<th>{runs_html(c)}</th>' for c in head) + '</tr></thead><tbody>'
+                          + ''.join('<tr>' + ''.join(f'<td>{runs_html(c)}</td>' for c in r) + '</tr>' for r in rest)
+                          + '</tbody></table>')
+      style = ('body{font-family:Calibri,Arial,sans-serif;line-height:1.5;max-width:960px;margin:24px auto;padding:0 16px}'
+               'table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px;text-align:left;'
+               'vertical-align:top}th{background:#f0f2f5}pre{background:#f6f8fa;padding:10px;overflow:auto}')
+      return (f'<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title or "Report")}</title>'
+              f'<style>{style}</style></head><body>{"".join(body)}</body></html>')
+
+
+  def blocks_text(blocks: List[Tuple[str, Any]], title: str, markdown: bool) -> str:
+      plain = lambda runs: ''.join(t for t, _ in runs)  # noqa: E731
+      out = [f'# {title}' if markdown else title] if title and not starts_with_h1(blocks) else []
+      for kind, p in blocks:
+          if kind == 'heading':
+              out.append(('#' * p[0] + ' ' if markdown else '') + plain(p[1]))
+          elif kind == 'para':
+              out.append(plain(p))
+          elif kind == 'code':
+              out.append(f'```\n{p}\n```' if markdown else p)
+          elif kind == 'hr':
+              out.append('---')
+          elif kind == 'list':
+              out.append('\n'.join('  ' * lvl + (f'{n}. ' if p[0] else '- ') + plain(r)
+                                   for n, (lvl, r) in enumerate(p[1], 1)))
+          elif kind == 'table':
+              rows = [[plain(c).replace('|', '\\|') for c in r] for r in p]
+              lines = ['| ' + ' | '.join(r) + ' |' for r in rows]
+              if markdown and lines:
+                  lines.insert(1, '|' + '---|' * len(rows[0]))
+              out.append('\n'.join(lines))
+      return '\n\n'.join(out) + '\n'
+
+
+  # ------------------------------------------------------------------ docx output (WordprocessingML, no library)
+  def _x(text: str) -> str:
+      return html.escape(text, quote=False)
+
+
+  def runs_docx(runs: List[Run], bold: bool = False) -> str:
+      out = []
+      for text, f in runs:
+          props = []
+          if f.get('b') or bold:
+              props.append('<w:b/>')
+          if f.get('i'):
+              props.append('<w:i/>')
+          if f.get('code'):
+              props.append('<w:rFonts w:ascii="Consolas" w:hAnsi="Consolas"/><w:shd w:val="clear" w:fill="F2F2F2"/>')
+          if f.get('href'):
+              props.append('<w:color w:val="0563C1"/><w:u w:val="single"/>')
+          rpr = f'<w:rPr>{"".join(props)}</w:rPr>' if props else ''
+          parts = text.split('\n')
+          for n, part in enumerate(parts):
+              out.append(f'<w:r>{rpr}<w:t xml:space="preserve">{_x(part)}</w:t></w:r>')
+              if n < len(parts) - 1:
+                  out.append('<w:r><w:br/></w:r>')
+      return ''.join(out)
+
+
+  def _para(inner: str, style: str = '', indent: int = 0) -> str:
+      ppr = ''
+      if style or indent:
+          ppr = '<w:pPr>' + (f'<w:pStyle w:val="{style}"/>' if style else '') + \
+                (f'<w:ind w:left="{indent}"/>' if indent else '') + '</w:pPr>'
+      return f'<w:p>{ppr}{inner}</w:p>'
+
+
+  def blocks_docx(blocks: List[Tuple[str, Any]], title: str) -> bytes:
+      body = [_para(runs_docx([(title, {})]), 'Title')] if title and not starts_with_h1(blocks) else []
+      for kind, p in blocks:
+          if kind == 'heading':
+              body.append(_para(runs_docx(p[1]), f'Heading{min(p[0], 4)}'))
+          elif kind == 'para':
+              body.append(_para(runs_docx(p)))
+          elif kind == 'code':
+              body.extend(_para(runs_docx([(line or ' ', {'code': True})]), 'Code') for line in p.split('\n'))
+          elif kind == 'hr':
+              body.append('<w:p><w:pPr><w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="999999"/>'
+                          '</w:pBdr></w:pPr></w:p>')
+          elif kind == 'list':
+              for n, (lvl, r) in enumerate(p[1], 1):
+                  marker = f'{n}. ' if p[0] else '\u2022 '
+                  body.append(_para(runs_docx([(marker, {})] + r), indent=360 * (lvl + 1)))
+          elif kind == 'table':
+              rows = []
+              header_shading = '<w:shd w:val="clear" w:fill="E7ECF2"/>'
+              for ri, row in enumerate(p):
+                  shading = header_shading if ri == 0 else ''
+                  cells = ''.join(f'<w:tc><w:tcPr>{shading}</w:tcPr>{_para(runs_docx(c, bold=ri == 0))}</w:tc>'
+                                  for c in row)
+                  rows.append(f'<w:tr>{cells}</w:tr>')
+              border = ''.join(f'<w:{s} w:val="single" w:sz="4" w:space="0" w:color="BFBFBF"/>'
+                               for s in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'))
+              body.append(f'<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="pct"/><w:tblBorders>{border}</w:tblBorders>'
+                          f'</w:tblPr>{"".join(rows)}</w:tbl>')
+              body.append('<w:p/>')
+      document = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                  '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+                  + ''.join(body) + '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" '
+                  'w:bottom="1134" w:left="1134" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>')
+
+      def style(sid: str, name: str, size: int, bold: bool = False, font: str = '', color: str = '') -> str:
+          rpr = (f'<w:rFonts w:ascii="{font}" w:hAnsi="{font}"/>' if font else '') + ('<w:b/>' if bold else '') + \
+                (f'<w:color w:val="{color}"/>' if color else '') + f'<w:sz w:val="{size}"/>'
+          return (f'<w:style w:type="paragraph" w:styleId="{sid}"><w:name w:val="{name}"/><w:basedOn w:val="Normal"/>'
+                  f'<w:pPr><w:spacing w:before="160" w:after="80"/></w:pPr><w:rPr>{rpr}</w:rPr></w:style>')
+      styles = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/>'
+                '<w:pPr><w:spacing w:after="120" w:line="276" w:lineRule="auto"/></w:pPr>'
+                '<w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:style>'
+                + style('Title', 'Title', 40, True, color='1F3864') + style('Heading1', 'heading 1', 32, True, color='1F3864')
+                + style('Heading2', 'heading 2', 28, True, color='2F5496') + style('Heading3', 'heading 3', 24, True)
+                + style('Heading4', 'heading 4', 22, True) + style('Code', 'Code', 18, font='Consolas') + '</w:styles>')
+      content_types = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                       '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                       '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                       '<Default Extension="xml" ContentType="application/xml"/>'
+                       '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.'
+                       'wordprocessingml.document.main+xml"/>'
+                       '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.'
+                       'wordprocessingml.styles+xml"/></Types>')
+      rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+              '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+              'officeDocument" Target="word/document.xml"/></Relationships>')
+      doc_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                  '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                  '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+                  'styles" Target="styles.xml"/></Relationships>')
+      buffer = io.BytesIO()
+      with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as z:
+          z.writestr('[Content_Types].xml', content_types)
+          z.writestr('_rels/.rels', rels)
+          z.writestr('word/document.xml', document)
+          z.writestr('word/_rels/document.xml.rels', doc_rels)
+          z.writestr('word/styles.xml', styles)
+      return buffer.getvalue()
+
+
+  # ------------------------------------------------------------------ pdf (nested GeneratePDF)
+  def render_pdf(content: str, is_html: bool, file_name: str, title: str, has_h1: bool,
+                 pdf_args: Dict[str, Any], script: str, keep_scripts: bool = False) -> str:
+      """Run GeneratePDF inside this run and return the file entry of the PDF it produced (its FileID is reused).
+
+      When the content already opens with its own h1, the title only goes into the running header.
+      keep_scripts is only for pages built here (diagrams), never for content the caller wrote.
+      """
+      call_args = {'Content': strip_active_content(content) if is_html and not keep_scripts else content,
+                   'InputFormat': 'html' if is_html else 'markdown', 'FileName': file_name}
+      if title:
+          call_args['HeaderText' if has_h1 else 'Title'] = title
+      call_args.update({k: v for k, v in pdf_args.items() if v})
+      response = demisto.executeCommand(script, call_args)
+      if is_error(response):
+          raise DemistoException(f"{script} failed: {get_error(response)}")
+      file_entry = next((e for e in response or [] if isinstance(e, dict) and e.get('FileID')), None)
+      if not file_entry:
+          raise DemistoException(f"{script} returned no file. Is it installed, and on the demisto/chromium image?")
+      # the same shape fileResult() returns (Type 3 = file); without ContentsFormat the war room shows a note
+      return {'Type': 3, 'ContentsFormat': 'text', 'Contents': '',
+              'File': file_entry.get('File') or file_name, 'FileID': file_entry['FileID']}
+
+
+  # ------------------------------------------------------------------ svg
+  def build_svg(content: str, out_fmt: str, name: str, title: str, pdf_args: Dict[str, Any],
+                pdf_script: str) -> Tuple[Optional[bytes], Optional[Dict[str, Any]]]:
+      """SVG the agent wrote (a chart, a timeline, a diagram): as .svg, in an HTML page, or rendered into a PDF.
+
+      Scripts and on*= handlers are removed first - a war room may render the SVG.
+      """
+      svg = strip_active_content(content.strip())
+      if '<svg' not in svg[:600].lower():
+          raise DemistoException("InputFormat=svg needs SVG markup starting with <svg (or an <?xml ...?> prolog).")
+      if out_fmt in ('same', 'svg'):
+          return svg.encode('utf-8'), None
+      heading = f'<h1>{html.escape(title)}</h1>' if title else ''
+      page = f'{heading}<div style="text-align:center">{svg}</div>'
+      if out_fmt == 'pdf':
+          return None, render_pdf(page, True, name, '', False, pdf_args, pdf_script)
+      if out_fmt == 'html':
+          return (f'<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title or "Chart")}</title>'
+                  f'</head><body style="font-family:Calibri,Arial,sans-serif">{page}</body></html>').encode('utf-8'), None
+      raise DemistoException(f"SVG can be delivered as svg, html or pdf, not {out_fmt}.")
+
+
+  # ------------------------------------------------------------------ diagrams (mermaid / draw.io / excalidraw)
+  def _script_json(value: Any) -> str:
+      """JSON safe to place inside a <script> element."""
+      return json.dumps(value).replace('</', '<\\/').replace('<!--', '<\\!--')
+
+
+  def diagram_page(kind: str, source: str, title: str, unescape: str = 'auto') -> str:
+      """A page that draws the diagram in the browser with the diagram's own library.
+
+      window.__pdfReady resolves once the drawing is done - to true - or with the error message when it
+      failed or did not finish within DIAGRAM_WAIT_MS; GeneratePDF waits for it and fails with that message
+      instead of printing the error page. The source is only ever data: escaped text, a JSON attribute or
+      a JSON script block - never markup or code.
+      """
+      heading = f'<h1>{html.escape(title)}</h1>' if title else ''
+      boot = ('<script>var diagramDone=false;window.__pdfReady=new Promise(function(r){'
+              'window.__pdfDone=function(v){diagramDone=true;r(v)}});'
+              'setTimeout(function(){diagramFailed("it did not finish within %d s")},%d);'
+              'function diagramFailed(e){if(diagramDone)return;var m="The diagram could not be drawn: "+(e&&e.message||e);'
+              'var p=document.getElementById("diagram-error");p.textContent=m;p.style.display="block";'
+              'window.__pdfDone(m)}</script>' % (DIAGRAM_WAIT_MS // 1000, DIAGRAM_WAIT_MS))
+      if kind == 'mermaid':
+          body = (f'<pre class="mermaid">{html.escape(clean_mermaid(source, unescape))}</pre>'
+                  '<script type="module">try{const m=(await import(' + json.dumps(MERMAID_JS) + ')).default;'
+                  'm.initialize({startOnLoad:false,securityLevel:"strict"});'
+                  'await m.run({querySelector:".mermaid"});window.__pdfDone(true)}catch(e){diagramFailed(e)}</script>')
+      elif kind == 'drawio':
+          config = {'xml': source.strip(), 'nav': False, 'resize': True, 'toolbar': '', 'lightbox': False, 'edit': None}
+          body = (f'<div id="drawio" data-mxgraph="{html.escape(json.dumps(config), quote=True)}"></div>'
+                  '<script>function drawioGo(){try{GraphViewer.createViewerForElement(document.getElementById("drawio"),'
+                  'function(){requestAnimationFrame(function(){window.__pdfDone(true)})})}catch(e){diagramFailed(e)}}</script>'
+                  f'<script src="{DRAWIO_JS}" onload="drawioGo()" '
+                  'onerror="diagramFailed(\'the draw.io viewer could not be loaded\')"></script>')
+      else:
+          try:
+              scene = json.loads(source)
+          except ValueError as e:
+              raise DemistoException(f"InputFormat=excalidraw needs the scene JSON (.excalidraw file content): {e}")
+          if not is_excalidraw(scene):
+              raise DemistoException('InputFormat=excalidraw needs an Excalidraw scene: {"type": "excalidraw", "elements": [...]}.')
+          body = (f'<div id="excalidraw"></div><script type="application/json" id="scene">{_script_json(scene)}</script>'
+                  '<script type="module">try{const lib=await import(' + json.dumps(EXCALIDRAW_JS) + ');'
+                  'const exportToSvg=lib.exportToSvg||(lib.default||{}).exportToSvg;'
+                  'const s=JSON.parse(document.getElementById("scene").textContent);const a=s.appState||{};'
+                  'const svg=await exportToSvg({elements:(s.elements||[]).filter(e=>!e.isDeleted),files:s.files||{},'
+                  'appState:{...a,exportBackground:true,viewBackgroundColor:a.viewBackgroundColor||"#ffffff"}});'
+                  'svg.style.maxWidth="100%";svg.style.height="auto";document.getElementById("excalidraw").appendChild(svg);'
+                  'window.__pdfDone(true)}catch(e){diagramFailed(e)}</script>')
+      style = ('body{font-family:Calibri,Arial,sans-serif;margin:24px}#drawio,#excalidraw,.mermaid{text-align:center}'
+               '.mermaid{background:none;border:0}svg{max-width:100%;height:auto}'
+               '#diagram-error{display:none;color:#b42318;font-weight:bold}')
+      return (f'<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title or "Diagram")}</title>'
+              f'<style>{style}</style>{boot}</head><body>{heading}<p id="diagram-error"></p>{body}</body></html>')
+
+
+  def build_diagram(content: str, kind: str, out_fmt: str, name: str, title: str, pdf_args: Dict[str, Any],
+                    pdf_script: str, unescape: str = 'auto') -> Tuple[Optional[bytes], Optional[Dict[str, Any]]]:
+      """Mermaid / draw.io / Excalidraw source: as-is (.mmd / .drawio / .excalidraw), an html page, or a PDF."""
+      if out_fmt == 'same':
+          return (clean_mermaid(content, unescape) if kind == 'mermaid' else content).encode('utf-8'), None
+      if out_fmt not in ('pdf', 'html'):
+          raise DemistoException(f"A {kind} diagram can be delivered as pdf, html or same (the source), not {out_fmt}.")
+      page = diagram_page(kind, content, title, unescape)
+      if out_fmt == 'html':
+          return page.encode('utf-8'), None
+      return None, render_pdf(page, True, name, '', False, pdf_args, pdf_script, keep_scripts=True)
+
+
+  # ------------------------------------------------------------------ main
+  def build_file(content: str, in_fmt: str, out_fmt: str, name: str, title: str,
+                 pdf_args: Dict[str, Any], pdf_script: str,
+                 unescape: str = 'auto') -> Tuple[Optional[bytes], Optional[Dict[str, Any]]]:
+      """Return (bytes, None) for files built here, or (None, file entry) for a PDF rendered by GeneratePDF."""
+      if in_fmt == 'base64':
+          if out_fmt not in ('same',):
+              raise DemistoException("InputFormat=base64 only supports OutputFormat=same (the bytes are kept as-is).")
+          return base64.b64decode(re.sub(r'\s+', '', content), validate=True), None
+      if in_fmt == 'svg':
+          return build_svg(content, out_fmt, name, title, pdf_args, pdf_script)
+      if in_fmt in DIAGRAM_FORMATS:
+          return build_diagram(content, in_fmt, out_fmt, name, title, pdf_args, pdf_script, unescape)
+      if out_fmt == 'svg':
+          raise DemistoException("OutputFormat=svg needs SVG markup as Content (InputFormat=svg).")
+      if out_fmt == 'same' or (out_fmt, in_fmt) in (('md', 'markdown'), ('txt', 'text'), ('html', 'html'),
+                                                    ('csv', 'csv'), ('json', 'json')):
+          return content.encode('utf-8'), None
+      if out_fmt == 'json':
+          raise DemistoException("OutputFormat=json needs InputFormat=json.")
+      blocks = to_blocks(content, in_fmt)
+      if out_fmt == 'pdf':
+          source = content if in_fmt in ('html', 'markdown') else blocks_html(blocks, '')
+          return None, render_pdf(source, in_fmt != 'markdown', name, title, starts_with_h1(blocks),
+                                  pdf_args, pdf_script)
+      if out_fmt == 'docx':
+          return blocks_docx(blocks, title), None
+      if out_fmt == 'html':
+          return blocks_html(blocks, title).encode('utf-8'), None
+      if out_fmt == 'csv':
+          table = next((p for k, p in blocks if k == 'table'), None)
+          if table is None:
+              raise DemistoException("OutputFormat=csv needs a table in the content (CSV, a Markdown/HTML table, or a JSON list).")
+          buffer = io.StringIO()
+          csv.writer(buffer).writerows([[''.join(t for t, _ in c) for c in row] for row in table])
+          return buffer.getvalue().encode('utf-8'), None
+      return blocks_text(blocks, title, markdown=out_fmt == 'md').encode('utf-8'), None
+
+
+  def file_name_for(name: str, out_fmt: str, in_fmt: str) -> str:
+      """Set the extension from the output format. Base64 bytes keep the caller's extension (e.g. logo.png)."""
+      name = name.strip()
+      given = re.search(EXTENSION_RE, name)
+      if in_fmt == 'base64' and given:
+          return name
+      ext = EXTENSIONS[in_fmt if out_fmt == 'same' else out_fmt]
+      stem = re.sub(EXTENSION_RE, '', name) or 'report'
+      return f'{stem}.{ext}'
+
+
+  def choice(args: Dict[str, Any], name: str, allowed: Tuple[str, ...], default: str) -> str:
+      value = str(args.get(name) or default).strip()
+      match = next((a for a in allowed if a.lower() == value.lower()), None)
+      if not match:
+          raise DemistoException(f"{name} must be one of {', '.join(allowed)}; got '{value}'.")
+      return match
+
+
+  def main() -> None:
+      try:
+          args = demisto.args()
+          content = args.get('Content') or ''
+          if not str(content).strip():
+              raise DemistoException("Content is required: the Markdown, HTML, text, CSV, JSON or SVG to turn into a file.")
+          content = str(content)
+          in_fmt = choice(args, 'InputFormat', INPUT_FORMATS, 'auto')
+          unescape = choice(args, 'Unescape', UNESCAPE_MODES, 'auto')
+          given = content
+          if in_fmt != 'base64':
+              content = unescape_content(content, unescape)
+          in_fmt = detect_format(content) if in_fmt == 'auto' else in_fmt
+          out_fmt = choice(args, 'OutputFormat', OUTPUT_FORMATS, 'same')
+          title = str(args.get('Title') or '').strip()
+          pdf_script = str(args.get('PdfScript') or 'GeneratePDF').strip()
+          pdf_args = {k: args.get(k) for k in ('Theme', 'PageSize', 'Orientation', 'IncludeTOC')}
+          name = file_name_for(str(args.get('FileName') or 'report'), out_fmt, in_fmt)
+
+          # Already unescaped above; diagrams only repeat the check (a no-op unless Unescape=false turned it off)
+          data, pdf_entry = build_file(content, in_fmt, out_fmt, name, title, pdf_args, pdf_script,
+                                       'false' if unescape == 'false' else 'auto')
+          # A normal file entry: the platform writes it to this war room and sets File.EntryID, Name, Size ...
+          file_entry = fileResult(name, data) if data is not None else pdf_entry
+          return_results(file_entry)
+
+          fmt = name.rsplit('.', 1)[-1] if out_fmt == 'same' else out_fmt
+          row = {'FileID': file_entry.get('FileID', ''), 'FileName': name, 'Format': fmt,
+                 'SizeBytes': len(data) if data is not None else None}
+          return_results(CommandResults(
+              outputs_prefix='CreateFile',
+              outputs=row,
+              readable_output=(f"{name} ({fmt}) created. File ID: {row['FileID']} - pass it as entryID to the "
+                               f"upload action to put the file in a case or issue war room."
+                               + (" Content arrived JSON-escaped or wrapped and was unescaped first "
+                                  "(Unescape=false keeps it as given)." if content != given else "")),
+              raw_response=row,
+          ))
+      except Exception as e:
+          demisto.error(f'{SCRIPT_NAME} failed:\n{traceback.format_exc()}')
+          return_error(f'Failed to execute {SCRIPT_NAME}. Error: {e}', error=e)
+
+
+  if __name__ in ('__main__', '__builtin__', 'builtins'):
+      main()
+
+
+  register_module_line('CreateFile', 'end', __line__())
+type: python
+tags: []
+comment: Creates a file from Markdown, HTML, text, CSV, JSON or SVG content, or a Mermaid / draw.io / Excalidraw diagram - as-is,
+  or converted to PDF, DOCX or HTML - and returns it as a file entry in the war room it runs in, with its file ID in CreateFile.FileID.
+  To deliver it to a case or issue, pass CreateFile.FileID as entryID to an upload action (duplicate of UploadFile).
+enabled: true
+args:
+- name: Content
+  required: true
+  description: 'The text to turn into a file: Markdown, HTML, plain text, CSV, JSON, SVG markup, or diagram source (Mermaid,
+    draw.io XML, Excalidraw scene JSON).'
+- name: InputFormat
+  description: 'Format of Content. auto: SVG if it starts with <svg, draw.io if it starts with <mxfile or <mxGraphModel, HTML
+    if it starts with a tag, Excalidraw if it is a scene JSON, JSON if it parses, Mermaid if it starts with a diagram keyword
+    (flowchart, sequenceDiagram ...) or a ```mermaid fence (also when sent as a JSON string or list, or with literal \n line
+    breaks; such Mermaid is repaired before use), Markdown otherwise. Diagrams can be output as pdf, html or same.
+    base64 only for small binary payloads copied from another action''s output.'
+  defaultValue: auto
+  auto: PREDEFINED
+  predefined:
+  - auto
+  - markdown
+  - html
+  - text
+  - csv
+  - json
+  - svg
+  - mermaid
+  - drawio
+  - excalidraw
+  - base64
+- name: OutputFormat
+  description: File format to create. same keeps the content as-is; pdf is rendered by GeneratePDF; docx is built by this
+    script.
+  defaultValue: same
+  auto: PREDEFINED
+  predefined:
+  - same
+  - pdf
+  - docx
+  - html
+  - md
+  - txt
+  - csv
+  - json
+  - svg
+- name: FileName
+  description: File name; the extension is set from the output format.
+  defaultValue: report
+- name: Title
+  description: Document title for pdf, docx and html. Skipped when the content opens with its own h1.
+- name: Theme
+  description: PDF theme passed to GeneratePDF.
+  auto: PREDEFINED
+  predefined:
+  - clean
+  - corporate
+  - dark-code
+  - minimal
+  - none
+- name: PageSize
+  description: PDF page size passed to GeneratePDF.
+  auto: PREDEFINED
+  predefined:
+  - A4
+  - Letter
+  - Legal
+- name: Orientation
+  description: PDF orientation passed to GeneratePDF.
+  auto: PREDEFINED
+  predefined:
+  - portrait
+  - landscape
+- name: IncludeTOC
+  description: Add a table of contents to the PDF.
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+- name: PdfScript
+  description: Script that renders PDFs.
+  defaultValue: GeneratePDF
+- name: Unescape
+  description: 'Undo the JSON escaping agents add (the document on one line with literal \n and \", or wrapped in "..." / ["..."]).
+    auto: only when Content is clearly escaped as a whole - legit content, minified JSON and code samples with a literal
+    \n are left alone. true: always decode one level. false: use Content exactly as given. Never applied to base64.'
+  defaultValue: auto
+  auto: PREDEFINED
+  predefined:
+  - auto
+  - 'true'
+  - 'false'
+outputs:
+- contextPath: CreateFile.FileID
+  description: File ID of the created file - pass it as entryID to the upload action.
+  type: String
+- contextPath: File.EntryID
+  description: Entry ID of the created file - pass it as entryID to the upload action.
+  type: String
+- contextPath: File.Name
+  description: File name.
+  type: String
+- contextPath: File.Size
+  description: File size in bytes.
+  type: Number
+- contextPath: File.SHA256
+  description: SHA256 of the file.
+  type: String
+- contextPath: File.Type
+  description: File type, e.g. PDF document, Microsoft Word 2007+.
+  type: String
+- contextPath: File.Extension
+  description: File extension.
+  type: String
+- contextPath: File.Info
+  description: File information (MIME type).
+  type: String
+- contextPath: CreateFile.FileName
+  description: Name of the file created.
+  type: String
+- contextPath: CreateFile.Format
+  description: Format of the file.
+  type: String
+- contextPath: CreateFile.SizeBytes
+  description: File size, for files built by this script (empty for PDF).
+  type: Number
+scripttarget: 0
+subtype: python3
+timeout: 600
+pswd: ''
+runonce: false
+dockerimage: demisto/python3:3.11.10.116949
+runas: DBotWeakRole
+engineinfo: {}
+mainengineinfo: {}

@@ -1,0 +1,439 @@
+commonfields:
+  id: f256e677-ff76-4849-ac40-346cf7463cbb
+  version: -1
+vcShouldKeepItemLegacyProdMachine: false
+name: PlaybookTaskFinder
+script: |
+  register_module_line('PlaybookTaskFinder', 'start', __line__())
+
+  """
+  PlaybookTaskFinder
+  ==================
+
+  Finds playbook tasks by task name, automation / integration command / builtin
+  name, or integration brand, and returns every match - with the task's inputs -
+  as context data (PlaybookTaskFinder.Task) and a war-room table.
+
+  Flow: one ``/playbook/search`` call -> skip excluded playbooks -> map
+  unpinned commands to their integration via ``/settings/integration-commands``
+  -> match each task against the filters (AND) -> one row per match, inputs
+  rendered readable -> context + war-room table.
+
+  Arguments
+  ---------
+  ``TaskName``       Match against the task name.
+  ``Automation``     Match against the automation, integration command or builtin name.
+  ``Brand``          Match against the integration brand ("Script" for automations).
+  ``OnError``        Only tasks with this error handling: Stop, Continue or Error path.
+  ``MatchMode``      contains (default), exact or regex. Always case-insensitive.
+  ``PlaybookQuery``  Query for /playbook/search. Default system:F (custom only).
+  ``IncludeSystem``  Also search out-of-the-box playbooks when PlaybookQuery is empty.
+  ``ExcludeNames``   Skip playbooks whose name contains any of these. Default shift,roster.
+  ``ExcludeTags``    Skip playbooks carrying any of these tags. Default jobs,job,operational.
+  ``PlaybookLimit``  Maximum playbooks to scan. Default 10000.
+  ``UsingInstance``  Core REST API instance. Default Core REST API_instance_1.
+
+  Outputs
+  -------
+  ``PlaybookTaskFinder.Task`` - one row per matching task: PlaybookName, PlaybookID,
+  TaskID, TaskName, TaskType, Automation, Brand, Description, NextTasks, OnError, TaskInputs.
+  ``PlaybookTaskFinder.ScannedPlaybooks`` / ``PlaybookTaskFinder.MatchedTasks`` - counts.
+  """
+
+
+  import json
+  import re
+  import traceback
+  from typing import Any, Dict, List
+
+  SCRIPT_NAME = 'PlaybookTaskFinder'
+  REPORT_COLUMNS = [
+      "PlaybookName", "PlaybookID", "TaskID", "TaskName", "TaskType", "Automation",
+      "Brand", "Description", "NextTasks", "OnError", "TaskInputs", "TaskInputsRaw",
+  ]
+  # Context keeps the readable inputs only; the raw JSON copy is for callers of build_task_row.
+  OUTPUT_COLUMNS = [c for c in REPORT_COLUMNS if c != "TaskInputsRaw"]
+  TABLE_COLUMNS = ["PlaybookName", "TaskID", "TaskName", "TaskType", "Automation", "Brand", "NextTasks",
+                   "OnError", "TaskInputs"]
+  # How NextTasks shows the special branches, as in the playbook editor; named condition branches keep their label
+  BRANCH_LABELS = {'#none#': '', '#default#': 'else ', '#error#': 'error '}
+  NO_ERROR_HANDLING_TYPES = {'start', 'title'}  # tasks that run nothing, so OnError is left empty
+  ON_ERROR_VALUES = ['Stop', 'Continue', 'Error path']
+
+
+  def get_playbooks(query: str, using: str, limit: int) -> List[Dict[str, Any]]:
+      """Retrieve playbooks from /playbook/search in one call, capped at a limit.
+
+      Args:
+          query: Query to filter playbooks (e.g. "system:F" for custom playbooks only).
+          using: Core REST API instance name.
+          limit: Maximum number of playbooks to keep.
+
+      Returns:
+          Playbook dicts, each carrying "id", "name", "tags" and "tasks".
+      """
+      # One call returns every matching playbook. Paging without a sort skipped some:
+      # the server's order shifts between calls, so pages overlap and leave gaps.
+      response = demisto.executeCommand('core-api-post', {
+          'uri': '/playbook/search',
+          'body': {'query': query},
+          'using': using,
+      })
+      if is_error(response):
+          raise DemistoException(f"core-api-post /playbook/search failed: {get_error(response)}")
+
+      playbooks = dict_safe_get(response, [0, 'Contents', 'response', 'playbooks'], []) or []
+      return playbooks[:limit]
+
+
+  def get_command_brands(using: str) -> Dict[str, List[str]]:
+      """Map each integration command to the integrations that provide it.
+
+      Used to fill Brand for tasks set to "use any instance", which store only
+      "|||command" with no brand.
+
+      Args:
+          using: Core REST API instance name.
+
+      Returns:
+          Command name -> integration brands providing it, for installed integrations only.
+      """
+      response = demisto.executeCommand('core-api-get', {'uri': '/settings/integration-commands', 'using': using})
+      if is_error(response):
+          raise DemistoException(f"core-api-get /settings/integration-commands failed: {get_error(response)}")
+
+      command_brands: Dict[str, List[str]] = {}
+      for integration in dict_safe_get(response, [0, 'Contents', 'response'], []) or []:
+          for command in integration.get('commands') or []:
+              command_brands.setdefault(command.get('name'), []).append(integration.get('name', ''))
+      return command_brands
+
+
+  def is_excluded(playbook: Dict[str, Any], exclude_names: List[str], exclude_tags: List[str]) -> bool:
+      """Decide whether a playbook is out of scope (e.g. Shift/Roster or Job playbooks).
+
+      Args:
+          playbook: Playbook dict from /playbook/search.
+          exclude_names: Lowercase substrings; a playbook whose name contains any is skipped.
+          exclude_tags: Lowercase tags; a playbook carrying any is skipped.
+
+      Returns:
+          True if the playbook should be skipped.
+      """
+      name = (playbook.get('name') or '').lower()
+      tags = {str(tag).lower() for tag in playbook.get('tags') or []}
+      return any(n in name for n in exclude_names) or bool(tags.intersection(exclude_tags))
+
+
+  def matches(value: str, needle: str, mode: str) -> bool:
+      """Check a task field against a search value, case-insensitively.
+
+      Args:
+          value: The task field to test (task name, command, brand...). None is treated as "".
+          needle: The search value from the script arguments.
+          mode: "contains", "exact" or "regex".
+
+      Returns:
+          True if the field matches.
+      """
+      value = value or ''
+      if mode == 'regex':
+          return re.search(needle, value, re.IGNORECASE) is not None
+      if mode == 'exact':
+          return value.lower() == needle.lower()
+      return needle.lower() in value.lower()
+
+
+  def format_inputs(script_args: Dict[str, Any]) -> str:
+      """Render a task's inputs as readable text for the report.
+
+      Args:
+          script_args: The task's "scriptarguments" block. Each value is either
+              {"simple": "..."} or {"complex": {"root", "accessor", "transformers", "filters"}}.
+
+      Returns:
+          One "arg = value" line per input, sorted by name. Complex inputs render as
+          "${root.accessor}" plus transformer names and "| filtered" when present.
+          Empty string when the task has no inputs.
+      """
+      lines: List[str] = []
+      for name, value in sorted((script_args or {}).items()):
+          value = value or {}
+          if 'simple' in value:
+              rendered = str(value['simple'])
+          elif 'complex' in value:
+              complex_value = value['complex'] or {}
+              path = '.'.join(p for p in (complex_value.get('root'), complex_value.get('accessor')) if p)
+              rendered = f"${{{path}}}"
+              transformers = [dict_safe_get(t, ['operator'], '') for t in complex_value.get('transformers') or []]
+              if transformers:
+                  rendered += f" | transformers: {', '.join(transformers)}"
+              if complex_value.get('filters'):
+                  rendered += " | filtered"
+          else:
+              rendered = json.dumps(value)
+          lines.append(f"{name} = {rendered}")
+      return '\n'.join(lines)
+
+
+  def format_targets(ids: Any) -> str:
+      """One target as its bare ID ("3"); several in brackets ("(1, 3)") so a reader cannot stop at the first."""
+      ids = [str(i) for i in ids or []]
+      return ids[0] if len(ids) == 1 else f"({', '.join(ids)})"
+
+
+  def format_next_tasks(task: Dict[str, Any]) -> str:
+      """Render where a task goes next: "-> 3", "-> (1, 3)", or "yes -> (4, 6); else -> 5; error -> 9" for branches.
+
+      REST API returns "nextTasks"; exported YAML uses "nexttasks". The normal path and named
+      condition branches come first, then else ("#default#"), then the error path ("#error#").
+      """
+      next_tasks = task.get('nextTasks') or task.get('nexttasks') or {}
+      branches = sorted(next_tasks.items(), key=lambda b: {'#default#': 1, '#error#': 2}.get(b[0], 0))
+      return '; '.join(f"{BRANCH_LABELS.get(branch, branch + ' ')}-> {format_targets(ids)}"
+                       for branch, ids in branches)
+
+
+  def on_error(task: Dict[str, Any]) -> str:
+      """What happens when the task errors: "Stop" (default), "Continue" or "Error path".
+
+      REST API returns continueOnError / continueOnErrorType; exported YAML uses the lowercase keys.
+      Empty for start and title tasks, which run nothing.
+      """
+      if task.get('type') in NO_ERROR_HANDLING_TYPES:
+          return ''
+      if (task.get('continueOnErrorType') or task.get('continueonerrortype')) == 'errorPath':
+          return 'Error path'
+      if task.get('continueOnError') or task.get('continueonerror'):
+          return 'Continue'
+      return 'Stop'
+
+
+  def build_task_row(playbook: Dict[str, Any], task_id: str, task: Dict[str, Any],
+                     command_brands: Dict[str, List[str]]) -> Dict[str, Any]:
+      """Build one report row for a task.
+
+      Integration commands and builtins reference "Brand|||command" (e.g.
+      "Builtin|||setIncident", "|||core-api-post"); automations reference their name.
+      Brand is "Script" for automations, and for unpinned commands ("|||command") it is
+      looked up in command_brands.
+
+      Args:
+          playbook: The playbook the task belongs to.
+          task_id: The task's ID within the playbook.
+          task: The task dict from the playbook's "tasks" map.
+          command_brands: Command name -> providing integrations, from get_command_brands().
+
+      Returns:
+          A dict keyed by REPORT_COLUMNS.
+      """
+      task_data = task.get('task') or {}
+      command_ref = task_data.get('scriptId') or task_data.get('script') or ''
+      script_brand, separator, script_command = command_ref.rpartition('|||')
+      brand = task_data.get('brand') or script_brand
+      if not brand and separator:
+          brand = ', '.join(command_brands.get(script_command, [])) or 'Any instance (integration not installed)'
+      elif not brand and script_command:
+          brand = 'Script'
+
+      # REST API returns "scriptArguments"; exported YAML uses "scriptarguments"
+      script_args = task.get('scriptArguments') or task.get('scriptarguments') or {}
+      return {
+          "PlaybookName": playbook.get('name', ''),
+          "PlaybookID": playbook.get('id', ''),
+          "TaskID": task_id,
+          "TaskName": task_data.get('name', ''),
+          "TaskType": task.get('type', ''),
+          "Automation": script_command,
+          "Brand": brand,
+          "Description": task_data.get('description', ''),
+          "NextTasks": format_next_tasks(task),
+          "OnError": on_error(task),
+          "TaskInputs": format_inputs(script_args),
+          "TaskInputsRaw": json.dumps(script_args, sort_keys=True),
+      }
+
+
+  def find_matching_tasks(playbooks: List[Dict[str, Any]], filters: Dict[str, str], mode: str,
+                          exclude_names: List[str], exclude_tags: List[str],
+                          command_brands: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+      """Scan every task of every in-scope playbook and keep those matching all given filters.
+
+      Args:
+          playbooks: Playbooks from get_playbooks().
+          filters: Search values for the report columns "TaskName", "Automation", "Brand", "OnError".
+              Empty values are ignored; the rest must all match (AND).
+          mode: Match mode passed to matches(). OnError always matches exactly.
+          exclude_names: Playbook-name substrings to skip.
+          exclude_tags: Playbook tags to skip.
+          command_brands: Command name -> providing integrations, from get_command_brands().
+
+      Returns:
+          Report rows for the matching tasks.
+      """
+      active_filters = {column: needle for column, needle in filters.items() if needle}
+      rows: List[Dict[str, Any]] = []
+      for playbook in playbooks:
+          if is_excluded(playbook, exclude_names, exclude_tags):
+              continue
+          for task_id, task in (playbook.get('tasks') or {}).items():
+              row = build_task_row(playbook, task_id, task, command_brands)
+              if all(matches(row[column], needle, 'exact' if column == 'OnError' else mode)
+                     for column, needle in active_filters.items()):
+                  rows.append(row)
+      return rows
+
+
+  def main() -> None:
+      """Orchestration only: read args, call helpers, return results."""
+      try:
+          args = demisto.args()
+          filters = {
+              "TaskName": args.get('TaskName', '').strip(),
+              "Automation": args.get('Automation', '').strip(),
+              "Brand": args.get('Brand', '').strip(),
+              "OnError": args.get('OnError', '').strip(),
+          }
+          mode = args.get('MatchMode', 'contains').lower()
+          include_system = argToBoolean(args.get('IncludeSystem', 'false'))
+          query = args.get('PlaybookQuery') or ('' if include_system else 'system:F')
+          exclude_names = [n.lower() for n in argToList(args.get('ExcludeNames', 'shift,roster'))]
+          exclude_tags = [t.lower() for t in argToList(args.get('ExcludeTags', 'jobs,job,operational'))]
+          limit = arg_to_number(args.get('PlaybookLimit', '10000'))
+          using = args.get('UsingInstance', 'Core REST API_instance_1')
+
+          if not any(filters.values()):
+              return_error("Provide at least one of TaskName, Automation, Brand or OnError.")
+          if filters["OnError"] and filters["OnError"].lower() not in [v.lower() for v in ON_ERROR_VALUES]:
+              return_error(f"OnError must be one of {', '.join(ON_ERROR_VALUES)}; got '{filters['OnError']}'.")
+
+          playbooks = get_playbooks(query, using, limit)
+          command_brands = get_command_brands(using)
+          rows = find_matching_tasks(playbooks, filters, mode, exclude_names, exclude_tags, command_brands)
+
+          summary = f"Scanned {len(playbooks)} playbooks, found {len(rows)} matching tasks."
+          tasks = [{column: row[column] for column in OUTPUT_COLUMNS} for row in rows]
+          readable = summary
+          if tasks:
+              readable += "\n\n" + tableToMarkdown("Matching tasks", tasks, headers=TABLE_COLUMNS, removeNull=True)
+          return_results(CommandResults(
+              outputs_prefix="PlaybookTaskFinder",
+              outputs={"Task": tasks, "ScannedPlaybooks": len(playbooks), "MatchedTasks": len(tasks)},
+              readable_output=readable,
+              raw_response=tasks,
+          ))
+      except Exception as e:
+          demisto.error(f'{SCRIPT_NAME} failed:\n{traceback.format_exc()}')
+          return_error(f'Failed to execute {SCRIPT_NAME}. Error: {e}', error=e)
+
+
+  if __name__ in ('__main__', '__builtin__', 'builtins'):
+      main()
+
+
+  register_module_line('PlaybookTaskFinder', 'end', __line__())
+type: python
+tags: []
+comment: Finds playbook tasks by task name, by the automation / integration command / builtin they run, or by integration
+  brand, and returns every match with its inputs as context data (PlaybookTaskFinder.Task) and a war-room table.
+enabled: true
+args:
+- name: TaskName
+  description: Match against the task name.
+- name: Automation
+  description: |-
+    Match against the automation, integration command or builtin name,
+    for example setIncident, core-api-post or Sleep.
+- name: Brand
+  description: |-
+    Match against the integration brand, for example Core REST API. Builtin
+    commands have the brand Builtin, automations the brand Script.
+- name: OnError
+  description: |-
+    Only tasks with this error handling: Stop (an error stops the playbook, the default),
+    Continue, or Error path. Use Stop with Brand or Automation to find tasks with no error handling.
+  auto: PREDEFINED
+  predefined:
+  - Stop
+  - Continue
+  - Error path
+- name: MatchMode
+  description: How TaskName, Automation and Brand match. Always case-insensitive. OnError always matches exactly.
+  defaultValue: contains
+  auto: PREDEFINED
+  predefined:
+  - contains
+  - exact
+  - regex
+- name: PlaybookQuery
+  description: Query sent to /playbook/search. Defaults to system:F (custom playbooks only).
+- name: IncludeSystem
+  description: Also search out-of-the-box playbooks when PlaybookQuery is empty.
+  defaultValue: 'false'
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+- name: ExcludeNames
+  description: Skip playbooks whose name contains any of these values.
+  defaultValue: shift,roster
+  isArray: true
+- name: ExcludeTags
+  description: Skip playbooks carrying any of these tags.
+  defaultValue: jobs,job,operational
+  isArray: true
+- name: PlaybookLimit
+  description: Maximum number of playbooks to scan.
+  defaultValue: '10000'
+- name: UsingInstance
+  description: Core REST API integration instance to use.
+  defaultValue: Core REST API_instance_1
+outputs:
+- contextPath: PlaybookTaskFinder.Task.PlaybookName
+  description: Name of the playbook the task is in.
+  type: String
+- contextPath: PlaybookTaskFinder.Task.PlaybookID
+  description: ID of the playbook.
+  type: String
+- contextPath: PlaybookTaskFinder.Task.TaskID
+  description: Task ID within the playbook.
+  type: String
+- contextPath: PlaybookTaskFinder.Task.TaskName
+  description: Task name.
+  type: String
+- contextPath: PlaybookTaskFinder.Task.TaskType
+  description: Task type (regular, condition, playbook, title...).
+  type: String
+- contextPath: PlaybookTaskFinder.Task.Automation
+  description: Automation, integration command or builtin the task runs.
+  type: String
+- contextPath: PlaybookTaskFinder.Task.Brand
+  description: Integration brand (Script for automations, resolved for unpinned commands).
+  type: String
+- contextPath: PlaybookTaskFinder.Task.Description
+  description: Task description.
+  type: String
+- contextPath: PlaybookTaskFinder.Task.NextTasks
+  description: Where the task goes next, e.g. '-> 3', '-> (1, 3)' or 'yes -> (4, 6); else -> 5; error -> 9'. Several targets of one branch are bracketed. Empty for end tasks.
+  type: String
+- contextPath: PlaybookTaskFinder.Task.OnError
+  description: 'What happens when the task fails: Stop (default), Continue or Error path. Empty for start and title tasks.'
+  type: String
+- contextPath: PlaybookTaskFinder.Task.TaskInputs
+  description: Task inputs, one 'arg = value' per line.
+  type: String
+- contextPath: PlaybookTaskFinder.ScannedPlaybooks
+  description: Number of playbooks scanned.
+  type: Number
+- contextPath: PlaybookTaskFinder.MatchedTasks
+  description: Number of matching tasks.
+  type: Number
+scripttarget: 0
+subtype: python3
+timeout: 600
+pswd: ''
+runonce: false
+dockerimage: demisto/python3:3.11.10.116949
+runas: DBotWeakRole
+engineinfo: {}
+mainengineinfo: {}

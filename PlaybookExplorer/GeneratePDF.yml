@@ -1,0 +1,1600 @@
+commonfields:
+  id: 8c177594-de1c-4955-8280-4cf418d264af
+  version: -1
+vcShouldKeepItemLegacyProdMachine: false
+name: GeneratePDF
+script: |-
+  register_module_line('GeneratePDF', 'start', __line__())
+
+  """
+  GeneratePDF
+  ===========
+
+  Turns Markdown or HTML into a styled PDF and returns it as a war room file.
+
+  Rendering is done by headless Chrome (the ``demisto/chromium`` image) through
+  the DevTools ``Page.printToPDF`` call, so the full modern CSS box model, web
+  fonts, background colours and repeating page headers / footers all work - the
+  things LibreOffice (``demisto/office-utils``, ``ConvertFile``) cannot do well.
+
+  Flow: read content -> Markdown to HTML (bundled converter) -> heading ids and
+  optional table of contents -> wrap in the theme or a custom template -> build
+  the running header / footer (with the logo embedded as a data URI) -> print
+  with Chrome -> count pages -> return the file entry and a context summary.
+
+  Input
+  -----
+  ``Content``      Markdown or HTML text.
+  ``EntryID``      A war room file holding the Markdown or HTML (instead of Content).
+  ``InputFormat``  ``auto`` (default), ``markdown`` or ``html``. ``auto`` picks HTML
+                   for ``.htm``/``.html`` files and for text that starts with a tag.
+
+  Look
+  ----
+  ``Title``            Title block on page 1 and ``{{title}}`` in templates.
+  ``Theme``            ``clean`` (default), ``corporate``, ``dark-code``, ``minimal``
+                       or ``none`` (no built-in CSS at all).
+  ``CustomCSS``        Extra CSS added after the theme.
+  ``IncludeTOC``       Insert a table of contents built from h1-h3.
+  ``TemplateListName`` A list holding a page template with a ``{{content}}``
+                       placeholder. ``{{title}}``, ``{{date}}`` and ``{{logo}}``
+                       are filled in as well.
+
+  Page
+  ----
+  ``PageSize`` (``A4``, ``Letter``, ``Legal``), ``Orientation`` (``portrait``,
+  ``landscape``), ``HeaderText``, ``FooterText``, ``ShowPageNumbers``,
+  ``LogoEntryID`` / ``LogoListName`` (PNG, JPEG, GIF or SVG; a list holds it as
+  base64 or a data URI), ``LogoPosition`` (``left``, ``right``, ``none``),
+  ``LogoHeight`` (pixels), and ``HeaderTemplate`` / ``FooterTemplate`` - custom
+  HTML replacing the default header / footer, with the same placeholders plus
+  Chrome's ``pageNumber`` and ``totalPages`` classes.
+
+  Output
+  ------
+  The PDF file entry (the engine adds it to ``File``), plus ``GeneratePDF.FileName``,
+  ``GeneratePDF.Title``, ``GeneratePDF.Pages`` and ``GeneratePDF.SizeBytes``.
+  """
+
+  import base64
+  import html as html_lib
+  import io
+  import json
+  import os
+  import re
+  import shutil
+  import subprocess
+  import tempfile
+  import time
+  import traceback
+  import urllib.request
+  from datetime import datetime, timezone
+  from pathlib import Path
+  from typing import Any, Dict, List, Optional, Tuple
+
+  SCRIPT_NAME = "GeneratePDF"
+
+  # Paper sizes in inches (width, height), portrait.
+  PAGE_SIZES: Dict[str, Tuple[float, float]] = {
+      "A4": (8.27, 11.69),
+      "Letter": (8.5, 11.0),
+      "Legal": (8.5, 14.0),
+  }
+
+  # Page margins in inches. The top and bottom grow when a running header or
+  # footer is printed, since Chrome draws those inside the margin.
+  SIDE_MARGIN = 0.6
+  PLAIN_MARGIN = 0.6
+  HEADER_MARGIN = 0.95
+  FOOTER_MARGIN = 0.75
+
+  # Where the Chrome binary lives. demisto/chromium installs Google Chrome at the
+  # first path and sets CHROME_EXE, as its rasterize integration expects.
+  CHROME_CANDIDATES = (
+      "/opt/google/chrome/google-chrome",
+      "google-chrome",
+      "google-chrome-stable",
+      "chromium",
+      "chromium-browser",
+  )
+
+  IMAGE_SIGNATURES: Tuple[Tuple[bytes, str], ...] = (
+      (b"\x89PNG\r\n\x1a\n", "image/png"),
+      (b"\xff\xd8\xff", "image/jpeg"),
+      (b"GIF87a", "image/gif"),
+      (b"GIF89a", "image/gif"),
+  )
+
+  THEMES = ("clean", "corporate", "dark-code", "minimal", "none")
+  INPUT_FORMATS = ("auto", "markdown", "html")
+  ORIENTATIONS = ("portrait", "landscape")
+  LOGO_POSITIONS = ("left", "right", "none")
+
+  HEADER_FONT = "'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, sans-serif"
+
+  BASE_CSS = """
+  :root {
+    --text: #1f2328; --muted: #59636e; --accent: #0969da; --heading: #1f2328;
+    --border: #d1d9e0; --code-bg: #f6f8fa; --code-text: #1f2328;
+    --th-bg: #f6f8fa; --th-text: #1f2328; --stripe: #fafbfc; --quote: #d1d9e0;
+    --font-body: 'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, sans-serif;
+    --font-head: var(--font-body);
+    --font-mono: 'Noto Sans Mono', 'DejaVu Sans Mono', 'Liberation Mono', Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    margin: 0; color: var(--text); font-family: var(--font-body);
+    font-size: 10.5pt; line-height: 1.6; word-wrap: break-word;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-head); color: var(--heading); line-height: 1.25;
+    margin: 1.4em 0 0.5em; font-weight: 600; break-after: avoid; page-break-after: avoid;
+  }
+  h1 { font-size: 1.9em; padding-bottom: 0.25em; border-bottom: 1px solid var(--border); }
+  h2 { font-size: 1.45em; padding-bottom: 0.2em; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1.2em; }
+  h4 { font-size: 1.05em; }
+  h5, h6 { font-size: 0.95em; color: var(--muted); }
+  p, ul, ol, dl, table, pre, blockquote { margin: 0 0 0.9em; }
+  a { color: var(--accent); text-decoration: none; }
+  strong { font-weight: 600; }
+  ul, ol { padding-left: 1.6em; }
+  li + li { margin-top: 0.2em; }
+  li > ul, li > ol { margin: 0.2em 0 0; }
+  li.task { list-style: none; margin-left: -1.3em; }
+  .checkbox { display: inline-block; width: 0.9em; margin-right: 0.35em; color: var(--accent); }
+  hr { border: 0; border-top: 1px solid var(--border); margin: 1.6em 0; }
+  img { max-width: 100%; }
+  blockquote {
+    margin-left: 0; padding: 0.1em 1em; color: var(--muted);
+    border-left: 0.25em solid var(--quote);
+  }
+  code, kbd, pre { font-family: var(--font-mono); font-size: 0.88em; }
+  code { background: var(--code-bg); color: var(--code-text); padding: 0.15em 0.35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); color: var(--code-text); padding: 0.85em 1em;
+    border-radius: 6px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; color: inherit; }
+  kbd {
+    border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px;
+    padding: 0.05em 0.35em; background: #fff;
+  }
+  table { border-collapse: collapse; width: 100%; break-inside: auto; font-size: 0.95em; }
+  thead { display: table-header-group; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
+  th, td { border: 1px solid var(--border); padding: 0.45em 0.7em; text-align: left; vertical-align: top; }
+  th { background: var(--th-bg); color: var(--th-text); font-weight: 600; }
+  tbody tr:nth-child(even) { background: var(--stripe); }
+  figure, img { break-inside: avoid; page-break-inside: avoid; }
+  .doc-title { margin: 0 0 1.6em; padding-bottom: 0.8em; border-bottom: 3px solid var(--accent); }
+  .doc-title-text {
+    font-family: var(--font-head); font-size: 2.3em; font-weight: 700; color: var(--heading); line-height: 1.2;
+  }
+  .doc-title-date { color: var(--muted); margin-top: 0.3em; font-size: 0.95em; }
+  nav.toc { margin: 0 0 2em; padding: 0.8em 1.2em; background: var(--code-bg); border-radius: 6px; break-inside: avoid; }
+  nav.toc .toc-title { font-weight: 600; margin-bottom: 0.4em; color: var(--heading); }
+  nav.toc ul { list-style: none; padding-left: 0; margin: 0; }
+  nav.toc li.toc-2 { padding-left: 1.2em; }
+  nav.toc li.toc-3 { padding-left: 2.4em; font-size: 0.95em; }
+  nav.toc a { color: var(--text); }
+  """
+
+  THEME_CSS: Dict[str, str] = {
+      "clean": "",
+      "corporate": """
+  :root {
+    --accent: #0b5cad; --heading: #0b2e59; --th-bg: #0b2e59; --th-text: #ffffff;
+    --stripe: #f2f6fb; --border: #c9d6e6; --quote: #0b5cad;
+  }
+  h1 { border-bottom: 2px solid var(--accent); }
+  h2 { border-bottom: none; color: var(--accent); }
+  """,
+      "dark-code": """
+  :root { --code-bg: #0d1117; --code-text: #e6edf3; }
+  code { background: #eff1f3; color: #cf222e; }
+  pre { border: 1px solid #30363d; }
+  nav.toc { background: #f6f8fa; }
+  """,
+      "minimal": """
+  :root {
+    --font-body: 'Noto Serif', 'Liberation Serif', Georgia, serif;
+    --font-head: 'Noto Sans', 'Liberation Sans', 'Helvetica Neue', Arial, sans-serif;
+    --accent: #333333; --stripe: transparent; --th-bg: transparent; --border: #e5e5e5;
+  }
+  body { font-size: 11pt; line-height: 1.7; }
+  h1, h2 { border-bottom: none; }
+  th { border-bottom: 2px solid #333; }
+  th, td { border-left: none; border-right: none; }
+  .doc-title { border-bottom-width: 1px; }
+  """,
+      "none": "",
+  }
+
+
+  # ── Markdown ─────────────────────────────────────────────────────────────
+  # The chromium image carries no Markdown library, so a compact converter is
+  # bundled. It covers CommonMark's everyday constructs plus GitHub tables, task
+  # lists and strikethrough, and passes raw HTML through untouched.
+
+  FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*([\w+#.-]*)[^`]*$")
+  HEADING_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
+  HR_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+  LIST_ITEM_RE = re.compile(r"^( {0,3})([-*+]|\d{1,9}[.)])(?:( +)(.*))?$")
+  TABLE_SEP_RE = re.compile(r"^ {0,3}\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+  QUOTE_RE = re.compile(r"^ {0,3}> ?(.*)$")
+  HTML_BLOCK_RE = re.compile(
+      r"^ {0,3}<(?:/?(?:address|article|aside|blockquote|details|div|dl|fieldset|figcaption|figure|"
+      r"footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|style|summary|table|tbody|td|tfoot|"
+      r"th|thead|tr|ul|svg|script|center)\b|!--)",
+      re.IGNORECASE,
+  )
+  TASK_RE = re.compile(r"^\[([ xX])\][ \t]+")
+  INLINE_TAG_RE = re.compile(r"</?[A-Za-z][\w-]*(?:\s[^<>]*)?/?>|<!--.*?-->", re.DOTALL)
+  AUTOLINK_RE = re.compile(r"<((?:https?|mailto|ftp):[^\s<>]+)>")
+  IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+\"([^\"]*)\")?\s*\)")
+  LINK_RE = re.compile(r"\[([^\]]+)\]\(\s*<?([^)\s>]+)>?(?:\s+\"([^\"]*)\")?\s*\)")
+  BARE_URL_RE = re.compile(r"(?<![\"'=(>])\b(https?://[^\s<]+[^\s<.,;:!?)\]'\"])")
+  CHECKED, UNCHECKED = "\u2611", "\u2610"
+  ENTITY_RE = re.compile(r"&amp;(#\d{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
+
+
+  def _stash(store: List[str], value: str) -> str:
+      """Park a finished fragment behind a placeholder the later passes ignore.
+
+      Args:
+          store: The fragment list the placeholder indexes into.
+          value: The HTML to protect.
+
+      Returns:
+          The placeholder text.
+      """
+      store.append(value)
+      return f"\x00{len(store) - 1}\x00"
+
+
+  def _unstash(text: str, store: List[str]) -> str:
+      """Put every stashed fragment back, including ones nested in others.
+
+      Args:
+          text: Text holding placeholders.
+          store: The fragments the placeholders index into.
+
+      Returns:
+          The text with each placeholder replaced by its fragment.
+      """
+      pattern = re.compile(r"\x00(\d+)\x00")
+      while pattern.search(text):
+          text = pattern.sub(lambda match: store[int(match.group(1))], text)
+      return text
+
+
+  def _safe_url(url: str) -> str:
+      """Escape a link target and neutralise script URLs.
+
+      Args:
+          url: The raw link target.
+
+      Returns:
+          An attribute-safe URL.
+      """
+      if re.match(r"^\s*(?:javascript|vbscript):", url, re.IGNORECASE):
+          return "#"
+      return html_lib.escape(url, quote=True)
+
+
+  def render_inline(text: str) -> str:
+      """Convert inline Markdown (emphasis, code, links, images) to HTML.
+
+      Args:
+          text: One block's worth of inline Markdown.
+
+      Returns:
+          The HTML for it.
+      """
+      store: List[str] = []
+
+      text = re.sub(r"\\([\\`*_{}\[\]()#+\-.!|~<>])",
+                    lambda m: _stash(store, html_lib.escape(m.group(1))), text)
+      text = re.sub(r"(`+)(.+?)(?<!`)\1(?!`)",
+                    lambda m: _stash(store, f"<code>{html_lib.escape(m.group(2).strip())}</code>"),
+                    text, flags=re.DOTALL)
+      text = AUTOLINK_RE.sub(
+          lambda m: _stash(store, f'<a href="{_safe_url(m.group(1))}">{html_lib.escape(m.group(1))}</a>'), text)
+      text = INLINE_TAG_RE.sub(lambda m: _stash(store, m.group(0)), text)
+
+      def image(match: "re.Match[str]") -> str:
+          title = f' title="{html_lib.escape(match.group(3))}"' if match.group(3) else ""
+          return _stash(store, f'<img src="{_safe_url(match.group(2))}" '
+                               f'alt="{html_lib.escape(match.group(1))}"{title}>')
+
+      text = IMAGE_RE.sub(image, text)
+
+      def link(match: "re.Match[str]") -> str:
+          title = f' title="{html_lib.escape(match.group(3))}"' if match.group(3) else ""
+          label = _render_emphasis(html_lib.escape(match.group(1), quote=False))
+          return _stash(store, f'<a href="{_safe_url(match.group(2))}"{title}>{label}</a>')
+
+      text = LINK_RE.sub(link, text)
+      text = BARE_URL_RE.sub(lambda m: _stash(store, f'<a href="{_safe_url(m.group(1))}">'
+                                                     f'{html_lib.escape(m.group(1))}</a>'), text)
+
+      text = html_lib.escape(text, quote=False)
+      text = ENTITY_RE.sub(r"&\1;", text)  # keep entities the author wrote, such as &nbsp;
+      text = _render_emphasis(text)
+      text = re.sub(r"(?: {2,}|\\)\n", "<br>\n", text)
+      return _unstash(text, store)
+
+
+  def _render_emphasis(text: str) -> str:
+      """Apply bold, italic and strikethrough markers.
+
+      Args:
+          text: Already-escaped inline text.
+
+      Returns:
+          The text with emphasis tags.
+      """
+      text = re.sub(r"(\*\*\*|___)(?=\S)(.+?)(?<=\S)\1", r"<strong><em>\2</em></strong>", text)
+      text = re.sub(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", r"<strong>\2</strong>", text)
+      text = re.sub(r"\*(?=[^\s*])(.+?)(?<=[^\s*])\*", r"<em>\1</em>", text)
+      text = re.sub(r"(?<![\w])_(?=[^\s_])(.+?)(?<=[^\s_])_(?![\w])", r"<em>\1</em>", text)
+      return re.sub(r"~~(?=\S)(.+?)(?<=\S)~~", r"<del>\1</del>", text)
+
+
+  def _split_row(line: str) -> List[str]:
+      """Split a table row on pipes that aren't escaped or inside code.
+
+      Args:
+          line: One row of a pipe table.
+
+      Returns:
+          The cell texts.
+      """
+      line = line.strip()
+      if line.startswith("|"):
+          line = line[1:]
+      if line.endswith("|") and not line.endswith("\\|"):
+          line = line[:-1]
+      cells, current, in_code = [], "", False
+      index = 0
+      while index < len(line):
+          char = line[index]
+          if char == "\\" and index + 1 < len(line) and line[index + 1] == "|":
+              current += "\\|"
+              index += 2
+              continue
+          if char == "`":
+              in_code = not in_code
+          if char == "|" and not in_code:
+              cells.append(current.strip())
+              current = ""
+          else:
+              current += char
+          index += 1
+      cells.append(current.strip())
+      return cells
+
+
+  def _render_table(lines: List[str]) -> str:
+      """Render a GitHub pipe table.
+
+      Args:
+          lines: Header row, separator row, then body rows.
+
+      Returns:
+          The table HTML.
+      """
+      header = _split_row(lines[0])
+      aligns: List[str] = []
+      for spec in _split_row(lines[1]):
+          if spec.startswith(":") and spec.endswith(":"):
+              aligns.append("center")
+          elif spec.endswith(":"):
+              aligns.append("right")
+          elif spec.startswith(":"):
+              aligns.append("left")
+          else:
+              aligns.append("")
+
+      def cell(tag: str, text: str, column: int) -> str:
+          align = aligns[column] if column < len(aligns) else ""
+          style = f' style="text-align:{align}"' if align else ""
+          return f"<{tag}{style}>{render_inline(text)}</{tag}>"
+
+      head = "".join(cell("th", text, column) for column, text in enumerate(header))
+      rows = []
+      for line in lines[2:]:
+          cells = _split_row(line)
+          cells = (cells + [""] * len(header))[:len(header)]
+          rows.append("<tr>" + "".join(cell("td", text, column) for column, text in enumerate(cells)) + "</tr>")
+      body = f"<tbody>{''.join(rows)}</tbody>" if rows else ""
+      return f"<table><thead><tr>{head}</tr></thead>{body}</table>"
+
+
+  def _indent_of(line: str) -> int:
+      """Count a line's leading spaces.
+
+      Args:
+          line: A tab-expanded line.
+
+      Returns:
+          The number of leading spaces.
+      """
+      return len(line) - len(line.lstrip(" "))
+
+
+  def _starts_block(line: str) -> bool:
+      """Tell whether a line opens a block that interrupts a paragraph.
+
+      Args:
+          line: The candidate line.
+
+      Returns:
+          True for fences, headings, rules, quotes, list items and HTML blocks.
+      """
+      return bool(FENCE_RE.match(line) or HEADING_RE.match(line) or HR_RE.match(line)
+                  or QUOTE_RE.match(line) or HTML_BLOCK_RE.match(line)
+                  or (LIST_ITEM_RE.match(line) and LIST_ITEM_RE.match(line).group(4)))
+
+
+  def _render_list(lines: List[str], start: int) -> Tuple[str, int]:
+      """Render one list (and its nested lists) beginning at ``start``.
+
+      Args:
+          lines: All lines of the enclosing block.
+          start: Index of the list's first item.
+
+      Returns:
+          The list HTML and the index of the first line after it.
+      """
+      first = LIST_ITEM_RE.match(lines[start])
+      ordered = first.group(2)[0].isdigit()
+      base_indent = len(first.group(1))
+      items: List[List[str]] = []
+      index = start
+      loose = False
+
+      while index < len(lines):
+          match = LIST_ITEM_RE.match(lines[index])
+          if not match or len(match.group(1)) != base_indent or match.group(2)[0].isdigit() != ordered:
+              break
+          content_indent = len(match.group(1)) + len(match.group(2)) + len(match.group(3) or " ")
+          body = [match.group(4) or ""]
+          index += 1
+          saw_blank = False
+          while index < len(lines):
+              line = lines[index]
+              if not line.strip():
+                  saw_blank = True
+                  body.append("")
+                  index += 1
+                  continue
+              indent = _indent_of(line)
+              if indent > base_indent:
+                  loose = loose or saw_blank
+                  body.append(line[min(indent, content_indent):])
+                  saw_blank = False
+                  index += 1
+                  continue
+              if not saw_blank and not _starts_block(line):
+                  body.append(line.strip())  # lazy paragraph continuation
+                  index += 1
+                  continue
+              break
+          while body and not body[-1].strip():
+              body.pop()
+          if saw_blank and index < len(lines) and LIST_ITEM_RE.match(lines[index]):
+              loose = True
+          items.append(body)
+
+      parts = []
+      for body in items:
+          task = TASK_RE.match(body[0]) if body else None
+          css = ""
+          if task:
+              checked = task.group(1).lower() == "x"
+              body = [f"<span class=\"checkbox\">{CHECKED if checked else UNCHECKED}</span>"
+                      + body[0][task.end():]] + body[1:]
+              css = ' class="task"'
+          parts.append(f"<li{css}>{render_blocks(body, tight=not loose)}</li>")
+
+      number = int(first.group(2)[:-1]) if ordered else 1
+      tag = "ol" if ordered else "ul"
+      start_attr = f' start="{number}"' if ordered and number != 1 else ""
+      return f"<{tag}{start_attr}>{''.join(parts)}</{tag}>", index
+
+
+  def render_blocks(lines: List[str], tight: bool = False) -> str:
+      """Convert block-level Markdown lines to HTML.
+
+      Args:
+          lines: Tab-expanded lines.
+          tight: Leave paragraphs unwrapped, as inside a tight list item.
+
+      Returns:
+          The HTML.
+      """
+      out: List[str] = []
+      index = 0
+      while index < len(lines):
+          line = lines[index]
+          if not line.strip():
+              index += 1
+              continue
+
+          fence = FENCE_RE.match(line)
+          if fence:
+              marker, language = fence.group(1), fence.group(2)
+              code: List[str] = []
+              index += 1
+              while index < len(lines) and not re.match(rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}\s*$",
+                                                        lines[index]):
+                  code.append(lines[index])
+                  index += 1
+              index += 1
+              css = f' class="language-{html_lib.escape(language)}"' if language else ""
+              out.append(f"<pre><code{css}>{html_lib.escape(chr(10).join(code))}</code></pre>")
+              continue
+
+          heading = HEADING_RE.match(line)
+          if heading:
+              level = len(heading.group(1))
+              out.append(f"<h{level}>{render_inline(heading.group(2) or '')}</h{level}>")
+              index += 1
+              continue
+
+          if HR_RE.match(line):
+              out.append("<hr>")
+              index += 1
+              continue
+
+          if QUOTE_RE.match(line):
+              quoted = []
+              while index < len(lines) and lines[index].strip():
+                  match = QUOTE_RE.match(lines[index])
+                  quoted.append(match.group(1) if match else lines[index].strip())
+                  index += 1
+              out.append(f"<blockquote>{render_blocks(quoted)}</blockquote>")
+              continue
+
+          if LIST_ITEM_RE.match(line) and (LIST_ITEM_RE.match(line).group(4) or "").strip() != "" \
+                  or re.match(r"^ {0,3}(?:[-*+]|\d{1,9}[.)])$", line):
+              html, index = _render_list(lines, index)
+              out.append(html)
+              continue
+
+          if "|" in line and index + 1 < len(lines) and TABLE_SEP_RE.match(lines[index + 1]) \
+                  and "-" in lines[index + 1]:
+              table = [line, lines[index + 1]]
+              index += 2
+              while index < len(lines) and lines[index].strip() and "|" in lines[index]:
+                  table.append(lines[index])
+                  index += 1
+              out.append(_render_table(table))
+              continue
+
+          if HTML_BLOCK_RE.match(line):
+              raw = []
+              while index < len(lines) and lines[index].strip():
+                  raw.append(lines[index])
+                  index += 1
+              out.append("\n".join(raw))
+              continue
+
+          paragraph = [line.lstrip()]
+          index += 1
+          while index < len(lines) and lines[index].strip() and not _starts_block(lines[index]):
+              if index + 1 < len(lines) and "|" in lines[index] and TABLE_SEP_RE.match(lines[index + 1]):
+                  break
+              paragraph.append(lines[index].lstrip())
+              index += 1
+          text = render_inline("\n".join(paragraph).rstrip())
+          out.append(text if tight else f"<p>{text}</p>")
+
+      return "\n".join(out)
+
+
+  def markdown_to_html(text: str) -> str:
+      """Convert a Markdown document to an HTML fragment.
+
+      Args:
+          text: The Markdown source.
+
+      Returns:
+          The HTML fragment.
+      """
+      lines = text.replace("\r\n", "\n").replace("\r", "\n").expandtabs(4).split("\n")
+      return render_blocks(lines)
+
+
+  # ── Document assembly ─────────────────────────────────────────────────────
+
+
+  def _slugify(text: str, used: Dict[str, int]) -> str:
+      """Make a unique anchor id from heading text.
+
+      Args:
+          text: The heading's plain text.
+          used: Slugs handed out so far, with their counts.
+
+      Returns:
+          A unique id.
+      """
+      slug = re.sub(r"[^\w\s-]", "", text.lower()).strip()
+      slug = re.sub(r"[\s_-]+", "-", slug) or "section"
+      count = used.get(slug, 0)
+      used[slug] = count + 1
+      return slug if count == 0 else f"{slug}-{count}"
+
+
+  def _plain_text(fragment: str) -> str:
+      """Strip tags and decode entities.
+
+      Args:
+          fragment: An HTML fragment.
+
+      Returns:
+          Its text.
+      """
+      return html_lib.unescape(re.sub(r"<[^>]+>", "", fragment)).strip()
+
+
+  def add_heading_ids(body: str) -> Tuple[str, List[Tuple[int, str, str]]]:
+      """Give every heading an id and collect h1-h3 for the table of contents.
+
+      Args:
+          body: The document HTML.
+
+      Returns:
+          The HTML with ids, and (level, id, text) for each h1-h3.
+      """
+      used: Dict[str, int] = {}
+      entries: List[Tuple[int, str, str]] = []
+
+      def replace(match: "re.Match[str]") -> str:
+          level, attrs, inner = int(match.group(1)), match.group(2), match.group(3)
+          existing = re.search(r"\bid\s*=\s*[\"']([^\"']+)[\"']", attrs)
+          text = _plain_text(inner)
+          anchor = existing.group(1) if existing else _slugify(text, used)
+          if level <= 3 and text:
+              entries.append((level, anchor, text))
+          if existing:
+              return match.group(0)
+          return f'<h{level}{attrs} id="{html_lib.escape(anchor)}">{inner}</h{level}>'
+
+      body = re.sub(r"<h([1-6])((?:\s[^>]*)?)>(.*?)</h\1>", replace, body, flags=re.DOTALL | re.IGNORECASE)
+      return body, entries
+
+
+  def build_toc(entries: List[Tuple[int, str, str]]) -> str:
+      """Render the table of contents.
+
+      Args:
+          entries: (level, id, text) for each heading.
+
+      Returns:
+          The TOC HTML, or an empty string when there are no headings.
+      """
+      if not entries:
+          return ""
+      top = min(level for level, _, _ in entries)
+      items = "".join(
+          f'<li class="toc-{level - top + 1}"><a href="#{html_lib.escape(anchor)}">{html_lib.escape(text)}</a></li>'
+          for level, anchor, text in entries
+      )
+      return f'<nav class="toc"><div class="toc-title">Contents</div><ul>{items}</ul></nav>'
+
+
+  def build_css(theme: str, custom_css: str) -> str:
+      """Combine the base, theme and custom CSS.
+
+      Args:
+          theme: One of THEMES.
+          custom_css: Caller-supplied CSS, applied last.
+
+      Returns:
+          The stylesheet text.
+      """
+      css = "" if theme == "none" else BASE_CSS + THEME_CSS[theme]
+      return css + ("\n" + custom_css if custom_css else "")
+
+
+  def is_full_document(text: str) -> bool:
+      """Tell whether HTML is a whole document rather than a fragment.
+
+      Args:
+          text: The HTML.
+
+      Returns:
+          True when it has a doctype or an <html> element.
+      """
+      return bool(re.search(r"<!doctype\s+html|<html[\s>]", text[:2000], re.IGNORECASE))
+
+
+  def inject_into_document(document: str, css: str, prefix: str) -> str:
+      """Add a stylesheet to a full HTML document and content after <body>.
+
+      Args:
+          document: A full HTML document.
+          css: The stylesheet to add (skipped when empty).
+          prefix: HTML to place at the start of <body> (skipped when empty).
+
+      Returns:
+          The updated document.
+      """
+      if css:
+          style = f"<style>{css}</style>"
+          if re.search(r"</head>", document, re.IGNORECASE):
+              document = re.sub(r"</head>", lambda _: style + "</head>", document, count=1, flags=re.IGNORECASE)
+          else:
+              document = re.sub(r"(<html[^>]*>)", lambda m: m.group(1) + f"<head>{style}</head>", document,
+                                count=1, flags=re.IGNORECASE)
+      if prefix:
+          if re.search(r"<body[^>]*>", document, re.IGNORECASE):
+              document = re.sub(r"(<body[^>]*>)", lambda m: m.group(1) + prefix, document, count=1,
+                                flags=re.IGNORECASE)
+          else:
+              document = re.sub(r"(</head>)", lambda m: m.group(1) + prefix, document, count=1,
+                                flags=re.IGNORECASE)
+      return document
+
+
+  def fill_placeholders(template: str, values: Dict[str, str]) -> str:
+      """Replace ``{{name}}`` placeholders (spaces inside braces allowed).
+
+      Args:
+          template: Template text.
+          values: Placeholder name to replacement HTML.
+
+      Returns:
+          The filled template. Unknown placeholders are left as they are.
+      """
+      return re.sub(r"\{\{\s*(\w+)\s*\}\}", lambda m: values.get(m.group(1).lower(), m.group(0)), template)
+
+
+  def assemble_document(body: str, is_html: bool, options: Dict[str, Any], template: Optional[str]) -> str:
+      """Build the full HTML page Chrome will print.
+
+      Args:
+          body: The HTML (converted from Markdown, or as given).
+          is_html: The input was HTML rather than Markdown.
+          options: Parsed script options.
+          template: A page template holding ``{{content}}``, or None.
+
+      Returns:
+          The complete HTML document.
+      """
+      css = build_css(options["theme"], options["custom_css"])
+      body, entries = add_heading_ids(body)
+      toc = build_toc(entries) if options["include_toc"] else ""
+      title = options["title"]
+      title_block = ""
+      if title and not template:
+          title_block = (f'<div class="doc-title"><div class="doc-title-text">{html_lib.escape(title)}</div>'
+                         f'<div class="doc-title-date">{html_lib.escape(options["date"])}</div></div>')
+
+      if is_html and is_full_document(body):
+          return inject_into_document(body, css, title_block + toc)
+
+      content = title_block + toc + body
+      if template:
+          page = fill_placeholders(template, {**options["placeholders"], "content": content})
+          if is_full_document(page):
+              return inject_into_document(page, css, "")
+          return _wrap(page, css, title)
+      return _wrap(content, css, title)
+
+
+  def _wrap(content: str, css: str, title: str) -> str:
+      """Wrap an HTML fragment in a document.
+
+      Args:
+          content: Body HTML.
+          css: Stylesheet text.
+          title: Document title for <title>.
+
+      Returns:
+          The HTML document.
+      """
+      return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+              f"<title>{html_lib.escape(title or SCRIPT_NAME)}</title><style>{css}</style></head>"
+              f"<body>{content}</body></html>")
+
+
+  # ── Header, footer and logo ───────────────────────────────────────────────
+
+
+  def image_data_uri(data: bytes) -> str:
+      """Encode image bytes as a data URI after checking the format.
+
+      Args:
+          data: PNG, JPEG, GIF or SVG bytes.
+
+      Returns:
+          The data URI.
+
+      Raises:
+          DemistoException: The bytes are not a supported image.
+      """
+      mime = next((mime for signature, mime in IMAGE_SIGNATURES if data.startswith(signature)), None)
+      if not mime and b"<svg" in data[:4096].lower():
+          mime = "image/svg+xml"
+      if not mime:
+          raise DemistoException("The logo is not a PNG, JPEG, GIF or SVG image.")
+      return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+  def logo_from_list_value(value: str) -> str:
+      """Turn a list's contents (data URI, base64, or SVG markup) into a data URI.
+
+      Args:
+          value: The list contents.
+
+      Returns:
+          The data URI.
+
+      Raises:
+          DemistoException: The contents are not a supported image.
+      """
+      value = value.strip()
+      match = re.match(r"^data:[\w/+.-]+;base64,(.*)$", value, re.DOTALL)
+      if match:
+          value = match.group(1)
+      if value.lstrip().startswith("<"):
+          return image_data_uri(value.encode())
+      try:
+          data = base64.b64decode(re.sub(r"\s+", "", value), validate=True)
+      except ValueError as exc:
+          raise DemistoException("The logo list must hold a base64 image, a data URI or SVG markup.") from exc
+      return image_data_uri(data)
+
+
+  def build_header_footer(options: Dict[str, Any], logo_uri: str) -> Tuple[str, str, bool]:
+      """Build Chrome's running header and footer templates.
+
+      Chrome renders these in an isolated context: no page CSS applies and the
+      default font size is near zero, so all styling is inline, and images must be
+      data URIs because external and file URLs are not fetched.
+
+      Args:
+          options: Parsed script options.
+          logo_uri: The logo as a data URI, or an empty string.
+
+      Returns:
+          The header template, the footer template, and whether to print them.
+      """
+      placeholders = options["placeholders"]
+      padding = f"0 {SIDE_MARGIN}in"
+      base_style = (f"width:100%;font-family:{HEADER_FONT};font-size:9px;color:#59636e;padding:{padding};"
+                    "display:flex;align-items:center;justify-content:space-between;"
+                    "-webkit-print-color-adjust:exact;print-color-adjust:exact;")
+
+      if options["header_template"]:
+          header = fill_placeholders(options["header_template"], placeholders)
+      else:
+          text = html_lib.escape(options["header_text"] or options["title"])
+          logo = placeholders["logo"] if logo_uri else ""
+          if logo and options["logo_position"] == "right":
+              left, right = f"<span>{text}</span>", logo
+          elif logo:
+              left, right = logo, f"<span>{text}</span>"
+          else:
+              left, right = f"<span>{text}</span>", "<span></span>"
+          rule = "border-bottom:0.5px solid #d1d9e0;padding-bottom:4px;"
+          header = (f'<div style="{base_style}"><div style="width:100%;display:flex;align-items:center;'
+                    f'justify-content:space-between;{rule}">{left}{right}</div></div>') if (text or logo) else ""
+
+      if options["footer_template"]:
+          footer = fill_placeholders(options["footer_template"], placeholders)
+      else:
+          text = html_lib.escape(options["footer_text"])
+          pages = ('<span>Page <span class="pageNumber"></span> of <span class="totalPages"></span></span>'
+                   if options["show_page_numbers"] else "<span></span>")
+          footer = f'<div style="{base_style}"><span>{text}</span>{pages}</div>' \
+              if (text or options["show_page_numbers"]) else ""
+
+      # An empty template makes Chrome print its own default (date, URL), so an
+      # unused side gets an empty span instead.
+      return header or "<span></span>", footer or "<span></span>", bool(header or footer)
+
+
+  # ── Chrome ────────────────────────────────────────────────────────────────
+
+
+  def find_chrome() -> str:
+      """Locate the Chrome binary.
+
+      Returns:
+          Path to the binary.
+
+      Raises:
+          DemistoException: No Chrome is installed (wrong Docker image).
+      """
+      for candidate in (os.getenv("CHROME_EXE"), *CHROME_CANDIDATES):
+          if not candidate:
+              continue
+          path = candidate if os.path.isabs(candidate) else shutil.which(candidate)
+          if path and os.path.isfile(path) and os.access(path, os.X_OK):
+              return path
+      raise DemistoException("Chrome was not found. Run this automation on the demisto/chromium Docker image.")
+
+
+  def _wait_for_port(profile_dir: str, process: "subprocess.Popen[bytes]", deadline: float) -> int:
+      """Read the DevTools port Chrome picked for ``--remote-debugging-port=0``.
+
+      Args:
+          profile_dir: Chrome's user data directory.
+          process: The Chrome process.
+          deadline: ``time.monotonic()`` value to give up at.
+
+      Returns:
+          The port.
+
+      Raises:
+          DemistoException: Chrome exited or did not start in time.
+      """
+      port_file = os.path.join(profile_dir, "DevToolsActivePort")
+      while time.monotonic() < deadline:
+          if process.poll() is not None:
+              raise DemistoException(f"Chrome exited during start-up with code {process.returncode}.")
+          try:
+              with open(port_file, encoding="utf-8") as handle:
+                  first_line = handle.readline().strip()
+              if first_line.isdigit():
+                  return int(first_line)
+          except OSError:
+              pass
+          time.sleep(0.1)
+      raise DemistoException("Chrome did not start within the timeout.")
+
+
+  class DevToolsSession:
+      """A minimal synchronous Chrome DevTools Protocol client for one page.
+
+      It sends one command at a time and reads replies in the calling thread,
+      remembering the events that arrive meanwhile, so there is no background
+      thread to race Chrome's shutdown.
+      """
+
+      def __init__(self, ws_url: str, deadline: float) -> None:
+          """Connect to a page target.
+
+          Args:
+              ws_url: The page's ``webSocketDebuggerUrl``.
+              deadline: ``time.monotonic()`` value every call must finish by.
+          """
+          import websocket  # websocket-client, on the chromium image
+
+          self.deadline = deadline
+          self.next_id = 0
+          self.events: List[str] = []
+          self.ws = websocket.create_connection(ws_url, timeout=self._remaining(), suppress_origin=True,
+                                                http_no_proxy=["127.0.0.1", "localhost"])
+
+      def _remaining(self) -> float:
+          """Seconds left before the deadline.
+
+          Returns:
+              The time left.
+
+          Raises:
+              TimeoutError: The deadline has passed.
+          """
+          remaining = self.deadline - time.monotonic()
+          if remaining <= 0:
+              raise TimeoutError("DevTools deadline reached")
+          return remaining
+
+      def _receive(self) -> Dict[str, Any]:
+          """Read the next message, remembering it if it is an event.
+
+          Returns:
+              The decoded message.
+          """
+          self.ws.settimeout(self._remaining())
+          message = json.loads(self.ws.recv())
+          if "method" in message:
+              self.events.append(message["method"])
+          return message
+
+      def call(self, method: str, **params: Any) -> Dict[str, Any]:
+          """Send a command and wait for its result.
+
+          Args:
+              method: The DevTools method, e.g. ``Page.printToPDF``.
+              **params: Its parameters.
+
+          Returns:
+              The command's result.
+
+          Raises:
+              DemistoException: Chrome returned an error.
+          """
+          self.next_id += 1
+          message_id = self.next_id
+          self.ws.send(json.dumps({"id": message_id, "method": method, "params": params}))
+          while True:
+              message = self._receive()
+              if message.get("id") == message_id:
+                  if "error" in message:
+                      raise DemistoException(f"{method} failed: {dict_safe_get(message, ['error', 'message'], '')}")
+                  return message.get("result") or {}
+
+      def wait_for_event(self, method: str) -> None:
+          """Block until an event has arrived.
+
+          Args:
+              method: The event name, e.g. ``Page.loadEventFired``.
+          """
+          while method not in self.events:
+              self._receive()
+
+      def close(self) -> None:
+          """Close the connection."""
+          try:
+              self.ws.close()
+          except Exception:  # noqa: S110 - Chrome may already be gone
+              pass
+
+
+  def open_page_target(port: int, deadline: float) -> str:
+      """Open a new blank page and return its DevTools websocket URL.
+
+      Args:
+          port: Chrome's DevTools port.
+          deadline: ``time.monotonic()`` value to give up at.
+
+      Returns:
+          The page's ``webSocketDebuggerUrl``.
+
+      Raises:
+          DemistoException: Chrome did not return a page target.
+      """
+      # Local connection: skip any proxy the engine's environment defines.
+      opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+      request = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?about:blank", method="PUT")
+      with opener.open(request, timeout=max(1.0, deadline - time.monotonic())) as response:
+          target = json.loads(response.read().decode())
+      ws_url = target.get("webSocketDebuggerUrl") if isinstance(target, dict) else None
+      if not ws_url:
+          raise DemistoException("Chrome did not open a page to print.")
+      return ws_url
+
+
+  def print_to_pdf(document: str, print_options: Dict[str, Any], timeout: int) -> bytes:
+      """Render an HTML document to PDF with headless Chrome.
+
+      The page is loaded from a local file so relative resources and data URIs
+      resolve, and the print waits for the load event, for ``window.__pdfReady`` when the
+      page sets it (a page that draws itself after load), and for web fonts.
+
+      Args:
+          document: The complete HTML document.
+          print_options: Arguments for DevTools ``Page.printToPDF``.
+          timeout: Seconds allowed for the whole render.
+
+      Returns:
+          The PDF bytes.
+
+      Raises:
+          DemistoException: Chrome failed or ran out of time.
+      """
+      workdir = tempfile.mkdtemp(prefix=f"{SCRIPT_NAME}_")
+      process = None
+      session = None
+      deadline = time.monotonic() + timeout
+      try:
+          html_path = os.path.join(workdir, "document.html")
+          with open(html_path, "w", encoding="utf-8") as handle:
+              handle.write(document)
+          profile_dir = os.path.join(workdir, "profile")
+          process = subprocess.Popen(
+              [find_chrome(), "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+               "--no-first-run", "--no-default-browser-check", "--hide-scrollbars", "--mute-audio",
+               "--remote-allow-origins=*", "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+               f"--user-data-dir={profile_dir}", "about:blank"],
+              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+          )
+          port = _wait_for_port(profile_dir, process, deadline)
+
+          session = DevToolsSession(open_page_target(port, deadline), deadline)
+          session.call("Page.enable")
+          session.call("Page.navigate", url=Path(html_path).as_uri())
+          session.wait_for_event("Page.loadEventFired")
+          # A page that draws itself after load (a diagram library) sets window.__pdfReady; wait for it, then fonts.
+          # A string it resolves to is the page's own failure message: fail with it rather than print the error.
+          ready = session.call("Runtime.evaluate", awaitPromise=True, returnByValue=True,
+                               expression="Promise.resolve(window.__pdfReady).then(r => document.fonts.ready"
+                                          ".then(() => typeof r === 'string' ? r : ''))")
+          problem = dict_safe_get(ready, ["result", "value"])
+          if problem:
+              raise DemistoException(str(problem))
+          data = session.call("Page.printToPDF", **print_options).get("data")
+          if not data:
+              raise DemistoException("Chrome returned no PDF data.")
+          return base64.b64decode(data)
+      except DemistoException:
+          raise
+      except Exception as exc:
+          if time.monotonic() >= deadline:
+              raise DemistoException(f"Rendering did not finish within {timeout} seconds.") from exc
+          raise DemistoException(f"Chrome failed to render the PDF: {exc}") from exc
+      finally:
+          if session is not None:
+              session.close()
+          if process is not None:
+              process.kill()
+              try:
+                  process.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  pass
+          shutil.rmtree(workdir, ignore_errors=True)
+
+
+  def count_pages(pdf: bytes) -> Optional[int]:
+      """Count the pages in a PDF.
+
+      Args:
+          pdf: The PDF bytes.
+
+      Returns:
+          The page count, or None when it cannot be read.
+      """
+      try:
+          from PyPDF2 import PdfReader  # on the chromium image
+
+          return len(PdfReader(io.BytesIO(pdf)).pages)
+      except Exception:
+          count = len(re.findall(rb"/Type\s*/Page(?!s)", pdf))
+          return count or None
+
+
+  # ── Platform I/O ──────────────────────────────────────────────────────────
+
+
+  def read_entry_file(entry_id: str) -> Tuple[bytes, str]:
+      """Read a war room file.
+
+      Args:
+          entry_id: The file's entry ID.
+
+      Returns:
+          The file bytes and its name.
+
+      Raises:
+          DemistoException: The entry is missing or is not a file.
+      """
+      response = demisto.executeCommand("getFilePath", {"id": entry_id})
+      if is_error(response):
+          raise DemistoException(f"Could not find file entry {entry_id}: {get_error(response)}")
+      path = dict_safe_get(response, [0, "Contents", "path"], "")
+      name = dict_safe_get(response, [0, "Contents", "name"], "") or ""
+      if not path or not os.path.isfile(path):
+          raise DemistoException(f"Entry {entry_id} is not a file.")
+      with open(path, "rb") as handle:
+          return handle.read(), name
+
+
+  def read_list(list_name: str, purpose: str) -> str:
+      """Read an XSOAR/XSIAM list.
+
+      Args:
+          list_name: The list name.
+          purpose: What the list is for, for error messages.
+
+      Returns:
+          The list contents.
+
+      Raises:
+          DemistoException: The list is missing, empty, or could not be read.
+      """
+      response = demisto.executeCommand("getList", {"listName": list_name})
+      if is_error(response):
+          raise DemistoException(f"Could not read the {purpose} list '{list_name}': {get_error(response)}")
+      contents = dict_safe_get(response, [0, "Contents"], "")
+      # getList reports a missing list as a successful entry holding this text.
+      if not isinstance(contents, str) or contents == "Item not found" or not contents.strip():
+          raise DemistoException(f"The {purpose} list '{list_name}' does not exist or is empty.")
+      return contents
+
+
+  def load_logo(options: Dict[str, Any]) -> str:
+      """Load the logo named by LogoEntryID or LogoListName.
+
+      Args:
+          options: Parsed script options.
+
+      Returns:
+          The logo data URI, or an empty string when none was given.
+      """
+      if options["logo_position"] == "none":
+          return ""
+      if options["logo_entry_id"]:
+          data, _ = read_entry_file(options["logo_entry_id"])
+          return image_data_uri(data)
+      if options["logo_list_name"]:
+          return logo_from_list_value(read_list(options["logo_list_name"], "logo"))
+      return ""
+
+
+  def detect_is_html(input_format: str, text: str, file_name: str) -> bool:
+      """Decide whether the content is HTML.
+
+      Args:
+          input_format: ``auto``, ``markdown`` or ``html``.
+          text: The content.
+          file_name: The source file name, if the content came from a file.
+
+      Returns:
+          True for HTML.
+      """
+      if input_format != "auto":
+          return input_format == "html"
+      if file_name:
+          suffix = Path(file_name).suffix.lower()
+          if suffix in (".html", ".htm", ".xhtml"):
+              return True
+          if suffix in (".md", ".markdown", ".txt"):
+              return False
+      return bool(re.match(r"\s*(<!doctype|<html|<body|<div|<table|<p[\s>]|<h[1-6])", text, re.IGNORECASE))
+
+
+  def _choice(args: Dict[str, Any], name: str, allowed: Tuple[str, ...], default: str) -> str:
+      """Read a predefined-choice argument, matching case-insensitively.
+
+      Args:
+          args: Script arguments.
+          name: Argument name.
+          allowed: Accepted values.
+          default: Value when the argument is empty.
+
+      Returns:
+          The canonical value.
+
+      Raises:
+          DemistoException: The value is not one of ``allowed``.
+      """
+      value = str(args.get(name) or default).strip()
+      for option in allowed:
+          if option.lower() == value.lower():
+              return option
+      raise DemistoException(f"{name} must be one of: {', '.join(allowed)}.")
+
+
+  def _bool(args: Dict[str, Any], name: str, default: bool) -> bool:
+      """Read a boolean argument with a clear error message.
+
+      Args:
+          args: Script arguments.
+          name: Argument name.
+          default: Value when the argument is empty.
+
+      Returns:
+          The boolean.
+
+      Raises:
+          DemistoException: The value is not a boolean.
+      """
+      value = args.get(name)
+      if value in (None, ""):
+          return default
+      try:
+          return argToBoolean(value)
+      except ValueError as exc:
+          raise DemistoException(f"{name} must be true or false.") from exc
+
+
+  def parse_options(args: Dict[str, Any]) -> Dict[str, Any]:
+      """Validate the arguments and gather them into one options dict.
+
+      Args:
+          args: ``demisto.args()``.
+
+      Returns:
+          The parsed options.
+
+      Raises:
+          DemistoException: An argument is invalid.
+      """
+      content = args.get("Content") or ""
+      entry_id = str(args.get("EntryID") or "").strip()
+      if bool(content.strip()) == bool(entry_id):
+          raise DemistoException("Provide exactly one of Content or EntryID.")
+      logo_entry_id = str(args.get("LogoEntryID") or "").strip()
+      logo_list_name = str(args.get("LogoListName") or "").strip()
+      if logo_entry_id and logo_list_name:
+          raise DemistoException("Provide at most one of LogoEntryID or LogoListName.")
+
+      try:
+          timeout = arg_to_number(args.get("Timeout") or 120, "Timeout")
+          logo_height = arg_to_number(args.get("LogoHeight") or 28, "LogoHeight")
+      except ValueError as exc:
+          raise DemistoException(str(exc)) from exc
+      if not timeout or timeout < 5:
+          raise DemistoException("Timeout must be at least 5 seconds.")
+      if not logo_height or not 8 <= logo_height <= 60:
+          raise DemistoException("LogoHeight must be between 8 and 60 pixels.")
+
+      file_name = str(args.get("FileName") or "").strip() or "report.pdf"
+      file_name = re.sub(r"[\\/:*?\"<>|]+", "_", file_name)
+      if not file_name.lower().endswith(".pdf"):
+          file_name += ".pdf"
+
+      page_size = _choice(args, "PageSize", tuple(PAGE_SIZES), "A4")
+
+      return {
+          "content": content,
+          "entry_id": entry_id,
+          "input_format": _choice(args, "InputFormat", INPUT_FORMATS, "auto"),
+          "file_name": file_name,
+          "title": str(args.get("Title") or "").strip(),
+          "theme": _choice(args, "Theme", THEMES, "clean"),
+          "custom_css": args.get("CustomCSS") or "",
+          "include_toc": _bool(args, "IncludeTOC", False),
+          "template_list_name": str(args.get("TemplateListName") or "").strip(),
+          "page_size": page_size,
+          "orientation": _choice(args, "Orientation", ORIENTATIONS, "portrait"),
+          "header_text": str(args.get("HeaderText") or "").strip(),
+          "footer_text": str(args.get("FooterText") or "").strip(),
+          "show_page_numbers": _bool(args, "ShowPageNumbers", True),
+          "header_template": args.get("HeaderTemplate") or "",
+          "footer_template": args.get("FooterTemplate") or "",
+          "logo_entry_id": logo_entry_id,
+          "logo_list_name": logo_list_name,
+          "logo_position": _choice(args, "LogoPosition", LOGO_POSITIONS, "left"),
+          "logo_height": logo_height,
+          "timeout": timeout,
+          "date": datetime.now(timezone.utc).strftime("%d %B %Y"),
+      }
+
+
+  def build_print_options(options: Dict[str, Any], header: str, footer: str, show: bool) -> Dict[str, Any]:
+      """Build the ``Page.printToPDF`` arguments.
+
+      Args:
+          options: Parsed script options.
+          header: Header template.
+          footer: Footer template.
+          show: Print the header and footer.
+
+      Returns:
+          The DevTools arguments.
+      """
+      width, height = PAGE_SIZES[options["page_size"]]
+      has_header = show and header != "<span></span>"
+      has_footer = show and footer != "<span></span>"
+      return {
+          "landscape": options["orientation"] == "landscape",
+          "printBackground": True,
+          "paperWidth": width,
+          "paperHeight": height,
+          "marginTop": HEADER_MARGIN if has_header else PLAIN_MARGIN,
+          "marginBottom": FOOTER_MARGIN if has_footer else PLAIN_MARGIN,
+          "marginLeft": SIDE_MARGIN,
+          "marginRight": SIDE_MARGIN,
+          "displayHeaderFooter": show,
+          "headerTemplate": header,
+          "footerTemplate": footer,
+          "preferCSSPageSize": False,
+          "generateDocumentOutline": True,
+          "generateTaggedPDF": True,
+      }
+
+
+  def generate_pdf(args: Dict[str, Any]) -> List[Any]:
+      """Run the whole conversion.
+
+      Args:
+          args: ``demisto.args()``.
+
+      Returns:
+          The file entry and the CommandResults, for ``return_results``.
+      """
+      options = parse_options(args)
+
+      source_name = ""
+      text = options["content"]
+      if options["entry_id"]:
+          data, source_name = read_entry_file(options["entry_id"])
+          text = data.decode("utf-8-sig", errors="replace")
+      is_html = detect_is_html(options["input_format"], text, source_name)
+
+      logo_uri = load_logo(options)
+      logo_tag = (f'<img src="{logo_uri}" style="height:{options["logo_height"]}px;width:auto;" alt="logo">'
+                  if logo_uri else "")
+      options["placeholders"] = {
+          "logo": logo_tag,
+          "title": html_lib.escape(options["title"]),
+          "date": html_lib.escape(options["date"]),
+      }
+
+      template = read_list(options["template_list_name"], "template") if options["template_list_name"] else None
+      if template is not None and not re.search(r"\{\{\s*content\s*\}\}", template, re.IGNORECASE):
+          raise DemistoException(f"The template list '{options['template_list_name']}' has no {{{{content}}}} "
+                                 "placeholder.")
+
+      body = text if is_html else markdown_to_html(text)
+      document = assemble_document(body, is_html, options, template)
+      header, footer, show = build_header_footer(options, logo_uri)
+      pdf = print_to_pdf(document, build_print_options(options, header, footer, show), options["timeout"])
+
+      pages = count_pages(pdf)
+      summary = {
+          "FileName": options["file_name"],
+          "Title": options["title"],
+          "Pages": pages,
+          "SizeBytes": len(pdf),
+      }
+      return [
+          fileResult(options["file_name"], pdf),
+          CommandResults(
+              outputs_prefix=SCRIPT_NAME,
+              outputs_key_field="FileName",
+              outputs=summary,
+              readable_output=tableToMarkdown("PDF generated", summary,
+                                              headers=["FileName", "Title", "Pages", "SizeBytes"]),
+          ),
+      ]
+
+
+  def main() -> None:
+      """Entry point: generate the PDF and report the result."""
+      try:
+          return_results(generate_pdf(demisto.args()))
+      except DemistoException as exc:
+          return_error(str(exc))
+      except Exception as exc:
+          return_error(f"{SCRIPT_NAME} failed: {exc}", error=traceback.format_exc())
+
+
+  if __name__ in ("__main__", "__builtin__", "builtins"):
+      main()
+
+
+  register_module_line('GeneratePDF', 'end', __line__())
+type: python
+tags: []
+comment: |-
+  Converts Markdown or HTML into a styled PDF with headless Chrome - themes,
+  table of contents, custom templates, and a running header / footer with a
+  logo and page numbers - and returns it as a war room file.
+enabled: true
+args:
+- name: Content
+  description: |-
+    Markdown or HTML text to convert. Provide this or EntryID.
+- name: EntryID
+  description: |-
+    War room file holding the Markdown or HTML. Provide this or Content.
+- name: InputFormat
+  description: |-
+    Format of the content. auto picks HTML for .htm/.html files and for
+    text starting with an HTML tag, Markdown otherwise.
+  defaultValue: "auto"
+  auto: PREDEFINED
+  predefined:
+  - auto
+  - markdown
+  - html
+- name: FileName
+  description: |-
+    Name of the PDF file. .pdf is appended when missing.
+  defaultValue: "report.pdf"
+- name: Title
+  description: |-
+    Title shown at the top of page 1 and in the default header. Also fills
+    the {{title}} placeholder in templates.
+- name: Theme
+  description: |-
+    Built-in stylesheet. none applies no built-in CSS.
+  defaultValue: "clean"
+  auto: PREDEFINED
+  predefined:
+  - clean
+  - corporate
+  - dark-code
+  - minimal
+  - none
+- name: CustomCSS
+  description: |-
+    Extra CSS applied after the theme.
+- name: IncludeTOC
+  description: |-
+    Insert a table of contents built from the h1-h3 headings.
+  defaultValue: "false"
+  auto: PREDEFINED
+  predefined:
+  - "true"
+  - "false"
+- name: TemplateListName
+  description: |-
+    Name of a list holding a page template (HTML and CSS) with a {{content}}
+    placeholder. {{title}}, {{date}} and {{logo}} are filled in too.
+- name: PageSize
+  description: |-
+    Paper size.
+  defaultValue: "A4"
+  auto: PREDEFINED
+  predefined:
+  - A4
+  - Letter
+  - Legal
+- name: Orientation
+  description: |-
+    Page orientation.
+  defaultValue: "portrait"
+  auto: PREDEFINED
+  predefined:
+  - portrait
+  - landscape
+- name: HeaderText
+  description: |-
+    Text in the running header. Defaults to Title.
+- name: FooterText
+  description: |-
+    Text on the left of the running footer.
+- name: ShowPageNumbers
+  description: |-
+    Show "Page X of Y" on the right of the footer.
+  defaultValue: "true"
+  auto: PREDEFINED
+  predefined:
+  - "true"
+  - "false"
+- name: LogoEntryID
+  description: |-
+    War room file holding the logo (PNG, JPEG, GIF or SVG).
+- name: LogoListName
+  description: |-
+    Name of a list holding the logo as base64, a data URI or SVG markup.
+- name: LogoPosition
+  description: |-
+    Where the logo sits in the default header. none hides it.
+  defaultValue: "left"
+  auto: PREDEFINED
+  predefined:
+  - left
+  - right
+  - none
+- name: LogoHeight
+  description: |-
+    Logo height in the header, in pixels (8-60).
+  defaultValue: "28"
+- name: HeaderTemplate
+  description: |-
+    Custom HTML for the running header, replacing the default. Supports
+    {{logo}}, {{title}}, {{date}} and Chrome's pageNumber / totalPages
+    classes. Style it inline; page CSS does not apply.
+- name: FooterTemplate
+  description: |-
+    Custom HTML for the running footer, replacing the default. Same
+    placeholders as HeaderTemplate.
+- name: Timeout
+  description: |-
+    Seconds allowed for rendering.
+  defaultValue: "120"
+outputs:
+- contextPath: GeneratePDF.FileName
+  description: Name of the generated PDF file.
+  type: String
+- contextPath: GeneratePDF.Title
+  description: The document title.
+  type: String
+- contextPath: GeneratePDF.Pages
+  description: Number of pages in the PDF.
+  type: Number
+- contextPath: GeneratePDF.SizeBytes
+  description: Size of the PDF in bytes.
+  type: Number
+scripttarget: 0
+subtype: python3
+timeout: 300
+pswd: ""
+runonce: false
+dockerimage: demisto/chromium:151.0.7922.11855526
+runas: DBotWeakRole
+engineinfo: {}
+mainengineinfo: {}

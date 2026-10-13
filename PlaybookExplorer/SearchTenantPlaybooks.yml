@@ -1,0 +1,803 @@
+commonfields:
+  id: 08c8fefa-182a-48e7-89df-0ae0350b1048
+  version: -1
+vcShouldKeepItemLegacyProdMachine: false
+name: SearchTenantPlaybooks
+script: |
+  register_module_line('SearchTenantPlaybooks', 'start', __line__())
+
+  """
+  SearchTenantPlaybooks
+  =====================
+
+  Generic playbook search for agents and analysts. Every argument is optional and
+  all given filters are combined with AND, so one automation answers questions
+  like "custom playbooks changed this week", "job playbooks", "which playbooks
+  call ad-disable-account", or "walk me through what playbook X does".
+
+  Flow: one ``/playbook/search`` call (Origin and Query pushed server-side)
+  -> match each playbook against the filters -> sort / limit -> shape
+  each result to the requested fields, optionally with its task list or full task
+  flow -> context + war-room table.
+
+  Arguments
+  ---------
+  ``Keyword`` / ``SearchIn``   Free text matched against name, description, tags and/or task text.
+  ``Name`` / ``NameMatch``     Playbook name, contains (default), exact or regex.
+  ``PlaybookID``               Exact playbook IDs.
+  ``Description``              Substring of the description.
+  ``Tags`` / ``TagsMatch``     Playbook tags, any (default) or all.
+  ``PackName`` / ``PackID``    Content pack.
+  ``Origin``                   custom (default), system or all. all scans every playbook and is slow.
+  ``Deprecated``               exclude (default), include or only.
+  ``IncludeHidden``            Include hidden playbooks. Default false.
+  ``UsesScript``               Tasks run this automation.
+  ``UsesCommand``              Tasks run this integration command or builtin.
+  ``UsesSubPlaybook``          Tasks run this sub-playbook.
+  ``UsesIntegration``          Tasks use this integration brand (unpinned commands resolved).
+  ``TaskName``                 Text in a task name or description.
+  ``ModifiedFrom/To/By``       Last-modified window ("7 days ago", ISO) and user.
+  ``Query``                    Raw /playbook/search query, ANDed with Origin.
+  ``Verbosity``                summary (default) or detailed.
+  ``ReturnFields``             Extra output fields to return (ID, Name, Description, Tags, System, PackName, Deprecated, ModifiedBy and Modified always).
+  ``TaskDetail``               none (default), names or flow.
+  ``MaxTasks``                 Task cap per playbook for TaskDetail. Default 200.
+  ``SortBy`` / ``SortOrder``   name (default) or modified; asc or desc.
+  ``Limit`` / ``MaxScan``      Results returned (50) / playbooks scanned (5000).
+  ``UsingInstance``            Core REST API instance. Default Core REST API_instance_1.
+
+  Outputs
+  -------
+  ``PlaybookSearch`` with ``Playbook`` rows plus ``TotalMatched``, ``Returned``,
+  ``Scanned``, ``TenantTotal`` and ``Truncated``. Read-only.
+  """
+
+
+  import json
+  import re
+  import traceback
+  from datetime import datetime, timezone
+  from typing import Any, Dict, List, Optional, Set
+
+  SCRIPT_NAME = 'SearchTenantPlaybooks'
+  ALWAYS_FIELDS = ["ID", "Name", "Description", "Tags", "System", "PackName", "Deprecated", "ModifiedBy",
+                   "Modified"]  # returned and shown whatever the other options
+  SUMMARY_FIELDS = ["TaskCount", "ErrorHandledTasks"]
+  DETAIL_FIELDS = ["PackID", "Hidden", "Version", "Scripts", "Commands", "SubPlaybooks", "Integrations",
+                   "Inputs", "Outputs"]
+  ALL_FIELDS = ALWAYS_FIELDS + SUMMARY_FIELDS + DETAIL_FIELDS
+  SEARCH_IN_VALUES = {"name", "description", "tags", "tasks"}
+  # How Next shows the special branches, as in the playbook editor; named condition branches keep their label
+  BRANCH_LABELS = {'#none#': '', '#default#': 'else ', '#error#': 'error '}
+  NO_ERROR_HANDLING_TYPES = {'start', 'title'}  # tasks that run nothing, so OnError is left empty
+
+
+  def get_playbooks(query: str, using: str, max_scan: int) -> Dict[str, Any]:
+      """Retrieve playbooks from /playbook/search in one call, capped at max_scan.
+
+      Args:
+          query: Server-side query ("" for all, "system:F" for custom only).
+          using: Core REST API instance name.
+          max_scan: Maximum number of playbooks to keep.
+
+      Returns:
+          {"playbooks": [...], "total": tenant total reported by the API or None}.
+      """
+      # One call returns every matching playbook, so no paging
+      response = demisto.executeCommand('core-api-post', {
+          'uri': '/playbook/search',
+          'body': {'query': query},
+          'using': using,
+      })
+      if is_error(response):
+          raise DemistoException(f"core-api-post /playbook/search failed: {get_error(response)}")
+
+      body = dict_safe_get(response, [0, 'Contents', 'response'], {}) or {}
+      if not isinstance(body, dict):
+          raise DemistoException(f"Unexpected /playbook/search response: {str(body)[:300]}")
+      playbooks = body.get('playbooks') or []
+      return {"playbooks": playbooks[:max_scan], "total": body.get('total')}
+
+
+  def get_command_brands(using: str) -> Dict[str, List[str]]:
+      """Map each integration command to the installed integrations that provide it.
+
+      Used to resolve tasks set to "use any instance", which store only "|||command".
+
+      Args:
+          using: Core REST API instance name.
+
+      Returns:
+          Command name -> integration brands.
+      """
+      response = demisto.executeCommand('core-api-get', {'uri': '/settings/integration-commands', 'using': using})
+      if is_error(response):
+          raise DemistoException(f"core-api-get /settings/integration-commands failed: {get_error(response)}")
+
+      command_brands: Dict[str, List[str]] = {}
+      for integration in dict_safe_get(response, [0, 'Contents', 'response'], []) or []:
+          for command in integration.get('commands') or []:
+              command_brands.setdefault(command.get('name'), []).append(integration.get('name', ''))
+      return command_brands
+
+
+  def task_runs(task_data: Dict[str, Any], command_brands: Dict[str, List[str]]) -> Dict[str, Any]:
+      """Describe what a task executes.
+
+      Commands and builtins are stored as "Brand|||command" ("|||command" when unpinned),
+      automations by name, sub-playbooks in playbookName / playbookId.
+
+      Args:
+          task_data: The task's inner "task" dict.
+          command_brands: Command -> brands, from get_command_brands() ({} when not loaded).
+
+      Returns:
+          {"kind": "script" | "command" | "playbook" | "", "target": str, "brands": [str]}.
+      """
+      command_ref = task_data.get('scriptId') or task_data.get('script') or ''
+      script_brand, separator, script_command = command_ref.rpartition('|||')
+      if separator:
+          brand = task_data.get('brand') or script_brand
+          brands = [brand] if brand else command_brands.get(script_command, [])
+          return {"kind": "command", "target": script_command, "brands": brands}
+      if script_command:
+          return {"kind": "script", "target": script_command, "brands": []}
+      sub_playbook = task_data.get('playbookName') or task_data.get('playbookId')
+      if sub_playbook:
+          return {"kind": "playbook", "target": sub_playbook, "brands": []}
+      return {"kind": "", "target": "", "brands": []}
+
+
+  def task_refs(playbook: Dict[str, Any], command_brands: Dict[str, List[str]]) -> Dict[str, Any]:
+      """Collect what the playbook's tasks use, for filtering and for the detailed fields.
+
+      Args:
+          playbook: Playbook dict from /playbook/search.
+          command_brands: Command -> brands, from get_command_brands().
+
+      Returns:
+          Sets of scripts, commands, sub-playbooks and integrations, plus "name description" text per task.
+      """
+      refs: Dict[str, Any] = {"script": set(), "command": set(), "playbook": set(), "integrations": set(),
+                              "task_text": []}
+      for task in (playbook.get('tasks') or {}).values():
+          task_data = task.get('task') or {}
+          refs["task_text"].append(f"{task_data.get('name') or ''} {task_data.get('description') or ''}")
+          runs = task_runs(task_data, command_brands)
+          if runs["kind"]:
+              refs[runs["kind"]].add(runs["target"])
+          refs["integrations"].update(b for b in runs["brands"] if b and b != 'Builtin')
+      return refs
+
+
+  def format_input(value: Any) -> str:
+      """Render one task input: the literal, or ${root.accessor} plus transformers / filter markers.
+
+      Args:
+          value: {"simple": ...} or {"complex": {"root", "accessor", "transformers", "filters"}}.
+
+      Returns:
+          Readable text for the input.
+      """
+      value = value or {}
+      if not isinstance(value, dict):
+          return str(value)
+      if 'simple' in value:
+          return str(value['simple'])
+      if 'complex' in value:
+          complex_value = value['complex'] or {}
+          path = '.'.join(p for p in (complex_value.get('root'), complex_value.get('accessor')) if p)
+          rendered = f"${{{path}}}"
+          transformers = [dict_safe_get(t, ['operator'], '') for t in complex_value.get('transformers') or []]
+          if transformers:
+              rendered += f" | transformers: {', '.join(transformers)}"
+          if complex_value.get('filters'):
+              rendered += " | filtered"
+          return rendered
+      return json.dumps(value)
+
+
+  def next_tasks(task: Dict[str, Any]) -> Dict[str, Any]:
+      """Branch -> next task IDs. REST API returns "nextTasks"; exported YAML uses "nexttasks"."""
+      return task.get('nextTasks') or task.get('nexttasks') or {}
+
+
+  def ordered_branches(task: Dict[str, Any]) -> List[Any]:
+      """(branch, next IDs) pairs: the normal path and named condition branches first, then else, then error."""
+      return sorted(next_tasks(task).items(), key=lambda b: {'#default#': 1, '#error#': 2}.get(b[0], 0))
+
+
+  def format_targets(ids: Any) -> str:
+      """One target as its bare ID ("3"); several in brackets ("(1, 3)") so a reader cannot stop at the first."""
+      ids = [str(i) for i in ids or []]
+      return ids[0] if len(ids) == 1 else f"({', '.join(ids)})"
+
+
+  def format_next(task: Dict[str, Any]) -> str:
+      """Render where a task goes next: "-> 3", "-> (1, 3)", or "yes -> (4, 6); else -> 5; error -> 9" for branches."""
+      return '; '.join(f"{BRANCH_LABELS.get(branch, branch + ' ')}-> {format_targets(ids)}"
+                       for branch, ids in ordered_branches(task))
+
+
+  def on_error(task: Dict[str, Any]) -> str:
+      """What happens when the task errors: "Stop" (default), "Continue" or "Error path".
+
+      REST API returns continueOnError / continueOnErrorType; exported YAML uses the lowercase keys.
+      Empty for start and title tasks, which run nothing.
+      """
+      if task.get('type') in NO_ERROR_HANDLING_TYPES:
+          return ''
+      if (task.get('continueOnErrorType') or task.get('continueonerrortype')) == 'errorPath':
+          return 'Error path'
+      if task.get('continueOnError') or task.get('continueonerror'):
+          return 'Continue'
+      return 'Stop'
+
+
+  def playbook_description(playbook: Dict[str, Any]) -> str:
+      """REST API returns the playbook description as "comment"; exported YAML uses "description"."""
+      return playbook.get('description') or playbook.get('comment') or ''
+
+
+  def task_flow(playbook: Dict[str, Any], command_brands: Dict[str, List[str]], max_tasks: int) -> List[Dict[str, Any]]:
+      """List the tasks in execution order, for an agent to explain what the playbook does.
+
+      Walks breadth-first from the start task, main branches before else and error paths;
+      tasks not reachable from the start (disconnected) are appended so nothing is hidden.
+
+      Args:
+          playbook: Playbook dict from /playbook/search.
+          command_brands: Command -> brands, from get_command_brands().
+          max_tasks: Maximum tasks to return.
+
+      Returns:
+          One dict per task, in that order: TaskID, Type, Name, Description, Runs, Inputs, Next, OnError.
+          The order is for reading only; the flow itself is in Next.
+          Next is format_next(), OnError is on_error().
+      """
+      tasks = playbook.get('tasks') or {}
+      order: List[str] = []
+      # REST API returns "startTaskId"; exported YAML uses "starttaskid"
+      queue = [str(playbook.get('startTaskId') or playbook.get('starttaskid') or '0')]
+      seen: Set[str] = set()
+      while queue:
+          task_id = queue.pop(0)
+          if task_id in seen or task_id not in tasks:
+              continue
+          seen.add(task_id)
+          order.append(task_id)
+          for _, next_ids in ordered_branches(tasks[task_id]):
+              queue.extend(str(n) for n in next_ids or [])
+      order += sorted((t for t in tasks if t not in seen), key=lambda t: int(t) if str(t).isdigit() else 0)
+
+      flow = []
+      for task_id in order[:max_tasks]:
+          task = tasks[task_id]
+          task_data = task.get('task') or {}
+          runs = task_runs(task_data, command_brands)
+          runs_text = f"{runs['kind']}: {runs['target']}" if runs['kind'] else ''
+          if runs['brands']:
+              runs_text += f" ({', '.join(runs['brands'])})"
+          # REST API returns "scriptArguments"; exported YAML uses "scriptarguments"
+          script_args = task.get('scriptArguments') or task.get('scriptarguments') or {}
+          flow.append({
+              "TaskID": task_id,
+              "Type": task.get('type', ''),
+              "Name": task_data.get('name', ''),
+              "Description": task_data.get('description', ''),
+              "Runs": runs_text,
+              "Inputs": {name: format_input(value) for name, value in sorted(script_args.items())},
+              "Next": format_next(task),
+              "OnError": on_error(task),
+          })
+      return flow
+
+
+  def any_in(wanted: List[str], have: Any) -> bool:
+      """Case-insensitive: True when any wanted value is a substring of any value we have."""
+      have_lower = [str(h).lower() for h in have if h]
+      return any(w.lower() in h for w in wanted for h in have_lower)
+
+
+  def name_matches(value: str, patterns: List[str], mode: str) -> bool:
+      """Match a playbook name against any pattern: contains, exact or regex (case-insensitive)."""
+      value = value or ''
+      for pattern in patterns:
+          if mode == 'regex' and re.search(pattern, value, re.IGNORECASE):
+              return True
+          if mode == 'exact' and value.lower() == pattern.lower():
+              return True
+          if mode == 'contains' and pattern.lower() in value.lower():
+              return True
+      return False
+
+
+  def to_utc(value: Any) -> Optional[datetime]:
+      """Parse a time argument ("7 days ago", ISO) into an aware UTC datetime (None when empty)."""
+      if not value:
+          return None
+      parsed = arg_to_datetime(value)
+      if not parsed:
+          return None
+      return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+  def api_time(value: Any) -> Optional[datetime]:
+      """Parse an API timestamp such as 2026-09-28T10:11:12.123456789Z (None when missing or unparsable).
+
+      The API emits nanoseconds, which fromisoformat rejects, so the fraction is cut to microseconds.
+      """
+      if not value:
+          return None
+      text = re.sub(r'(\.\d{6})\d+', r'\1', str(value)).replace('Z', '+00:00')
+      try:
+          parsed = datetime.fromisoformat(text)
+      except ValueError:
+          return None
+      return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+  def modified_by(playbook: Dict[str, Any]) -> str:
+      return playbook.get('modifiedBy') or playbook.get('lastModifiedBy') or playbook.get('user') or ''
+
+
+  def playbook_matches(playbook: Dict[str, Any], refs: Dict[str, Any], f: Dict[str, Any]) -> bool:
+      """Apply every given filter (AND). Empty filters are ignored.
+
+      Args:
+          playbook: Playbook dict from /playbook/search.
+          refs: task_refs() for this playbook.
+          f: Parsed filters from main().
+
+      Returns:
+          True if the playbook passes all filters.
+      """
+      if f["keyword"]:
+          haystack: List[Any] = []
+          if "name" in f["search_in"]:
+              haystack.append(playbook.get('name'))
+          if "description" in f["search_in"]:
+              haystack.append(playbook_description(playbook))
+          if "tags" in f["search_in"]:
+              haystack += playbook.get('tags') or []
+          if "tasks" in f["search_in"]:
+              haystack += refs["task_text"]
+          if not any_in(f["keyword"], haystack):
+              return False
+      if f["ids"] and playbook.get('id') not in f["ids"]:
+          return False
+      if f["names"] and not name_matches(playbook.get('name'), f["names"], f["name_match"]):
+          return False
+      if f["description"] and f["description"].lower() not in playbook_description(playbook).lower():
+          return False
+
+      tags = {str(t).lower() for t in playbook.get('tags') or []}
+      wanted_tags = {t.lower() for t in f["tags"]}
+      if wanted_tags and f["tags_match"] == 'all' and not wanted_tags.issubset(tags):
+          return False
+      if wanted_tags and f["tags_match"] == 'any' and not wanted_tags.intersection(tags):
+          return False
+
+      if f["pack_name"] and not any_in(f["pack_name"], [playbook.get('packName'), playbook.get('packID')]):
+          return False
+      if f["pack_id"] and (playbook.get('packID') or '') not in f["pack_id"]:
+          return False
+      is_system = bool(playbook.get('system'))
+      if (f["origin"] == 'custom' and is_system) or (f["origin"] == 'system' and not is_system):
+          return False
+      is_deprecated = bool(playbook.get('deprecated'))
+      if (f["deprecated"] == 'exclude' and is_deprecated) or (f["deprecated"] == 'only' and not is_deprecated):
+          return False
+      if not f["include_hidden"] and playbook.get('hidden'):
+          return False
+
+      if f["uses_script"] and not any_in(f["uses_script"], refs["script"]):
+          return False
+      if f["uses_command"] and not any_in(f["uses_command"], refs["command"]):
+          return False
+      if f["uses_subplaybook"] and not any_in(f["uses_subplaybook"], refs["playbook"]):
+          return False
+      if f["uses_integration"] and not any_in(f["uses_integration"], refs["integrations"]):
+          return False
+      if f["task_name"] and not any_in(f["task_name"], refs["task_text"]):
+          return False
+
+      if f["modified_by"] and not any_in(f["modified_by"], [modified_by(playbook)]):
+          return False
+      if f["modified_from"] or f["modified_to"]:
+          modified = api_time(playbook.get('modified'))
+          if not modified:
+              return False
+          if f["modified_from"] and modified < f["modified_from"]:
+              return False
+          if f["modified_to"] and modified > f["modified_to"]:
+              return False
+      return True
+
+
+  def build_row(playbook: Dict[str, Any], refs: Dict[str, Any], fields: List[str], task_detail: str,
+                command_brands: Dict[str, List[str]], max_tasks: int) -> Dict[str, Any]:
+      """Shape one result to the requested fields, plus Tasks when TaskDetail asks for them."""
+      full = {
+          "ID": playbook.get('id'),
+          "Name": playbook.get('name'),
+          "Description": playbook_description(playbook),
+          "Tags": playbook.get('tags') or [],
+          "PackName": playbook.get('packName') or playbook.get('packID'),
+          "System": bool(playbook.get('system')),
+          "Deprecated": bool(playbook.get('deprecated')),
+          "Modified": playbook.get('modified'),
+          "ModifiedBy": modified_by(playbook),
+          "TaskCount": len(playbook.get('tasks') or {}),
+          "ErrorHandledTasks": sum(on_error(task) in ('Continue', 'Error path')
+                                   for task in (playbook.get('tasks') or {}).values()),
+          "PackID": playbook.get('packID'),
+          "Hidden": bool(playbook.get('hidden')),
+          "Version": playbook.get('version'),
+          "Scripts": sorted(refs["script"]),
+          "Commands": sorted(refs["command"]),
+          "SubPlaybooks": sorted(refs["playbook"]),
+          "Integrations": sorted(refs["integrations"]),
+          "Inputs": [i.get('key') for i in playbook.get('inputs') or [] if i.get('key')],
+          "Outputs": [o.get('contextPath') for o in playbook.get('outputs') or [] if o.get('contextPath')],
+      }
+      row = {field: full[field] for field in fields}
+      if task_detail == 'names':
+          row["Tasks"] = [t["Name"] for t in task_flow(playbook, command_brands, max_tasks) if t["Name"]]
+      elif task_detail == 'flow':
+          row["Tasks"] = task_flow(playbook, command_brands, max_tasks)
+      return row
+
+
+  def server_query(query: str, origin: str) -> str:
+      """AND the Origin filter into the raw query so the server does the custom / system split."""
+      origin_query = {'custom': 'system:F', 'system': 'system:T'}.get(origin, '')
+      return ' and '.join(q for q in (query.strip(), origin_query) if q)
+
+
+  def parse_choice(args: Dict[str, Any], name: str, default: str, allowed: List[str]) -> str:
+      value = (args.get(name) or default).strip().lower()
+      if value not in allowed:
+          raise DemistoException(f"{name} must be one of {', '.join(allowed)}; got '{value}'.")
+      return value
+
+
+  def main() -> None:
+      """Orchestration only: read args, call helpers, return results."""
+      try:
+          args = demisto.args()
+          f = {
+              "keyword": argToList(args.get('Keyword')),
+              "search_in": [s.lower() for s in argToList(args.get('SearchIn') or 'name,description')],
+              "names": argToList(args.get('Name')),
+              "name_match": parse_choice(args, 'NameMatch', 'contains', ['contains', 'exact', 'regex']),
+              "ids": argToList(args.get('PlaybookID')),
+              "description": (args.get('Description') or '').strip(),
+              "tags": argToList(args.get('Tags')),
+              "tags_match": parse_choice(args, 'TagsMatch', 'any', ['any', 'all']),
+              "pack_name": argToList(args.get('PackName')),
+              "pack_id": argToList(args.get('PackID')),
+              "origin": parse_choice(args, 'Origin', 'custom', ['custom', 'system', 'all']),
+              "deprecated": parse_choice(args, 'Deprecated', 'exclude', ['exclude', 'include', 'only']),
+              "include_hidden": argToBoolean(args.get('IncludeHidden') or 'false'),
+              "uses_script": argToList(args.get('UsesScript')),
+              "uses_command": argToList(args.get('UsesCommand')),
+              "uses_subplaybook": argToList(args.get('UsesSubPlaybook')),
+              "uses_integration": argToList(args.get('UsesIntegration')),
+              "task_name": argToList(args.get('TaskName')),
+              "modified_by": argToList(args.get('ModifiedBy')),
+              "modified_from": to_utc(args.get('ModifiedFrom')),
+              "modified_to": to_utc(args.get('ModifiedTo')),
+          }
+          verbosity = parse_choice(args, 'Verbosity', 'summary', ['summary', 'detailed'])
+          task_detail = parse_choice(args, 'TaskDetail', 'none', ['none', 'names', 'flow'])
+          sort_by = parse_choice(args, 'SortBy', 'name', ['name', 'modified'])
+          sort_order = parse_choice(args, 'SortOrder', 'desc' if sort_by == 'modified' else 'asc', ['asc', 'desc'])
+          limit = arg_to_number(args.get('Limit')) or 50
+          max_scan = arg_to_number(args.get('MaxScan')) or 5000
+          max_tasks = arg_to_number(args.get('MaxTasks')) or 200
+          using = args.get('UsingInstance') or 'Core REST API_instance_1'
+
+          unknown_search_in = set(f["search_in"]) - SEARCH_IN_VALUES
+          if unknown_search_in:
+              raise DemistoException(f"SearchIn accepts {', '.join(sorted(SEARCH_IN_VALUES))}; "
+                                     f"got {', '.join(sorted(unknown_search_in))}.")
+          requested = argToList(args.get('ReturnFields'))
+          unknown_fields = [r for r in requested if r not in ALL_FIELDS]
+          if unknown_fields:
+              raise DemistoException(f"Unknown ReturnFields {unknown_fields}. Valid: {', '.join(ALL_FIELDS)}")
+          if requested:
+              fields = ALWAYS_FIELDS + [r for r in requested if r not in ALWAYS_FIELDS]
+          else:
+              fields = ALL_FIELDS if verbosity == 'detailed' else ALWAYS_FIELDS + SUMMARY_FIELDS
+          if f["name_match"] == 'regex':
+              for pattern in f["names"]:
+                  try:
+                      re.compile(pattern)
+                  except re.error as e:
+                      raise DemistoException(f"Invalid regex in Name '{pattern}': {e}")
+
+          result = get_playbooks(server_query(args.get('Query') or '', f["origin"]), using, max_scan)
+          playbooks, total = result["playbooks"], result["total"]
+          # Unpinned commands only name their brand via this lookup; skip the call when nothing needs it
+          needs_brands = bool(f["uses_integration"]) or 'Integrations' in fields or task_detail == 'flow'
+          command_brands = get_command_brands(using) if needs_brands else {}
+
+          matched = []
+          for playbook in playbooks:
+              refs = task_refs(playbook, command_brands)
+              if playbook_matches(playbook, refs, f):
+                  matched.append((playbook, refs))
+          if sort_by == 'modified':
+              matched.sort(key=lambda m: api_time(m[0].get('modified')) or datetime.min.replace(tzinfo=timezone.utc),
+                           reverse=sort_order == 'desc')
+          else:
+              matched.sort(key=lambda m: (m[0].get('name') or '').lower(), reverse=sort_order == 'desc')
+
+          rows = [build_row(pb, refs, fields, task_detail, command_brands, max_tasks) for pb, refs in matched[:limit]]
+          scan_truncated = total is not None and len(playbooks) < total
+          context = {
+              "Playbook": rows,
+              "TotalMatched": len(matched),
+              "Returned": len(rows),
+              "Scanned": len(playbooks),
+              "TenantTotal": total,
+              "Truncated": len(matched) > limit or scan_truncated,
+          }
+
+          note = f"Matched {len(matched)} of {len(playbooks)} playbooks scanned (tenant total: {total})."
+          if len(matched) > limit:
+              note += f" Showing the first {limit}; raise Limit or narrow the filters."
+          if scan_truncated:
+              note += f" Scan stopped at MaxScan={max_scan}; results may be incomplete."
+          if not rows:
+              readable = "No playbooks matched the given filters."
+          else:
+              # ALWAYS_FIELDS always show, even when empty; other columns only when a row has a value
+              table_fields = [h for h in fields if h not in ("Inputs", "Outputs") and
+                              (h in ALWAYS_FIELDS or any(row.get(h) not in ("", None, [], {}) for row in rows))]
+              table_rows = [{**row, "Tags": ", ".join(map(str, row.get("Tags") or []))} for row in rows]
+              readable = tableToMarkdown("Playbook Search Results", table_rows, headers=table_fields)
+              if task_detail == 'flow':
+                  for row in rows:
+                      readable += tableToMarkdown(f"Task flow: {row['Name']}", row["Tasks"],
+                                                  headers=["TaskID", "Type", "Name", "Runs", "Next", "OnError",
+                                                           "Description"],
+                                                  removeNull=True)
+
+          return_results(CommandResults(
+              outputs_prefix="PlaybookSearch",
+              outputs=context,
+              readable_output=f"{note}\n\n{readable}",
+              raw_response=context,
+          ))
+      except Exception as e:
+          demisto.error(f'{SCRIPT_NAME} failed:\n{traceback.format_exc()}')
+          return_error(f'Failed to execute {SCRIPT_NAME}. Error: {e}', error=e)
+
+
+  if __name__ in ('__main__', '__builtin__', 'builtins'):
+      main()
+
+
+  register_module_line('SearchTenantPlaybooks', 'end', __line__())
+type: python
+tags: []
+comment: Generic, read-only playbook search. Filter tenant playbooks by keyword, name, tags, pack, origin, lifecycle, the
+  scripts / commands / sub-playbooks / integrations their tasks use, and modification time, and optionally return each playbook's
+  task flow.
+enabled: true
+args:
+- name: Keyword
+  description: Free text found in the fields chosen by SearchIn. Several values = any of them. Case-insensitive.
+  isArray: true
+- name: SearchIn
+  description: 'Fields Keyword is matched against: name, description, tags, tasks (task names and descriptions).'
+  defaultValue: name,description
+  isArray: true
+- name: Name
+  description: Playbook name, matched per NameMatch. Several values = any of them.
+  isArray: true
+- name: NameMatch
+  description: How Name is matched (case-insensitive).
+  defaultValue: contains
+  auto: PREDEFINED
+  predefined:
+  - contains
+  - exact
+  - regex
+- name: PlaybookID
+  description: Exact playbook IDs.
+  isArray: true
+- name: Description
+  description: Substring the playbook description must contain.
+- name: Tags
+  description: Playbook tags. Job playbooks in this tenant are tagged job, jobs or operational.
+  isArray: true
+- name: TagsMatch
+  description: any = at least one tag present, all = every tag present.
+  defaultValue: any
+  auto: PREDEFINED
+  predefined:
+  - any
+  - all
+- name: PackName
+  description: Content pack name (substring).
+  isArray: true
+- name: PackID
+  description: Content pack ID (exact).
+  isArray: true
+- name: Origin
+  description: custom = tenant-built (default), system = out-of-the-box, all = both. Sent to the server as system:F / system:T. all scans every playbook and can take minutes; use it only when out-of-the-box playbooks are needed too.
+  defaultValue: custom
+  auto: PREDEFINED
+  predefined:
+  - custom
+  - system
+  - all
+- name: Deprecated
+  description: exclude deprecated playbooks, include them, or return only deprecated ones.
+  defaultValue: exclude
+  auto: PREDEFINED
+  predefined:
+  - exclude
+  - include
+  - only
+- name: IncludeHidden
+  description: Include hidden playbooks.
+  defaultValue: 'false'
+  auto: PREDEFINED
+  predefined:
+  - 'true'
+  - 'false'
+- name: UsesScript
+  description: Playbooks with a task running this automation (substring), e.g. SetGridField.
+  isArray: true
+- name: UsesCommand
+  description: Playbooks with a task running this integration command or builtin (substring), e.g. ad-disable-account, setIncident.
+  isArray: true
+- name: UsesSubPlaybook
+  description: Playbooks calling this sub-playbook (substring of its name).
+  isArray: true
+- name: UsesIntegration
+  description: Playbooks with a task using this integration brand (substring). Unpinned commands are resolved to the installed
+    integrations providing them.
+  isArray: true
+- name: TaskName
+  description: Text in any task name or task description.
+  isArray: true
+- name: ModifiedFrom
+  description: 'Only playbooks modified at or after this time: relative (7 days ago) or ISO 8601, UTC.'
+- name: ModifiedTo
+  description: 'Only playbooks modified at or before this time: relative or ISO 8601, UTC.'
+- name: ModifiedBy
+  description: User who last modified the playbook (substring).
+  isArray: true
+- name: Query
+  description: Raw /playbook/search query for advanced use, ANDed with Origin. Normally empty.
+- name: Verbosity
+  description: summary = ID, name, description, tags, pack, flags, modified, task count, error-handled task count. detailed = adds scripts, commands,
+    sub-playbooks, integrations, inputs, outputs.
+  defaultValue: summary
+  auto: PREDEFINED
+  predefined:
+  - summary
+  - detailed
+- name: ReturnFields
+  description: 'Return only these extra fields (ID, Name, Description, Tags, System, PackName, Deprecated, ModifiedBy and Modified always). Overrides Verbosity. Valid:
+    TaskCount, ErrorHandledTasks, PackID, Hidden, Version, Scripts, Commands, SubPlaybooks, Integrations, Inputs,
+    Outputs.'
+  isArray: true
+- name: TaskDetail
+  description: none = no tasks, names = task names in execution order, flow = every task in execution order with type, what
+    it runs, inputs, next steps and error handling (to explain what a playbook does).
+  defaultValue: none
+  auto: PREDEFINED
+  predefined:
+  - none
+  - names
+  - flow
+- name: MaxTasks
+  description: Maximum tasks returned per playbook when TaskDetail is names or flow.
+  defaultValue: '200'
+- name: SortBy
+  description: Sort results by name or by last-modified time.
+  defaultValue: name
+  auto: PREDEFINED
+  predefined:
+  - name
+  - modified
+- name: SortOrder
+  description: asc or desc. Defaults to asc for name and desc (newest first) for modified.
+  auto: PREDEFINED
+  predefined:
+  - asc
+  - desc
+- name: Limit
+  description: Maximum playbooks returned.
+  defaultValue: '50'
+- name: MaxScan
+  description: Maximum playbooks scanned from the tenant.
+  defaultValue: '5000'
+- name: UsingInstance
+  description: Core REST API integration instance to use.
+  defaultValue: Core REST API_instance_1
+outputs:
+- contextPath: PlaybookSearch.Playbook.ID
+  description: Playbook ID.
+  type: String
+- contextPath: PlaybookSearch.Playbook.Name
+  description: Playbook name.
+  type: String
+- contextPath: PlaybookSearch.Playbook.Description
+  description: Playbook description.
+  type: String
+- contextPath: PlaybookSearch.Playbook.Tags
+  description: Playbook tags.
+  type: Unknown
+- contextPath: PlaybookSearch.Playbook.PackName
+  description: Content pack the playbook belongs to.
+  type: String
+- contextPath: PlaybookSearch.Playbook.System
+  description: True for out-of-the-box playbooks, false for custom.
+  type: Boolean
+- contextPath: PlaybookSearch.Playbook.Deprecated
+  description: Whether the playbook is deprecated.
+  type: Boolean
+- contextPath: PlaybookSearch.Playbook.Modified
+  description: Last-modified time (UTC).
+  type: Date
+- contextPath: PlaybookSearch.Playbook.ModifiedBy
+  description: User who last modified the playbook.
+  type: String
+- contextPath: PlaybookSearch.Playbook.TaskCount
+  description: Number of tasks.
+  type: Number
+- contextPath: PlaybookSearch.Playbook.ErrorHandledTasks
+  description: Tasks set to continue on error or to take an error path. 0 means any task error stops the playbook.
+  type: Number
+- contextPath: PlaybookSearch.Playbook.Scripts
+  description: Automations the tasks run (detailed).
+  type: Unknown
+- contextPath: PlaybookSearch.Playbook.Commands
+  description: Integration commands and builtins the tasks run (detailed).
+  type: Unknown
+- contextPath: PlaybookSearch.Playbook.SubPlaybooks
+  description: Sub-playbooks called (detailed).
+  type: Unknown
+- contextPath: PlaybookSearch.Playbook.Integrations
+  description: Integration brands used (detailed).
+  type: Unknown
+- contextPath: PlaybookSearch.Playbook.Inputs
+  description: Playbook input names (detailed).
+  type: Unknown
+- contextPath: PlaybookSearch.Playbook.Outputs
+  description: Playbook output context paths (detailed).
+  type: Unknown
+- contextPath: PlaybookSearch.Playbook.Tasks
+  description: Task names, or the task flow (TaskID, Type, Name, Description, Runs, Inputs, Next, OnError), per TaskDetail. Tasks are listed in reading order; the flow is in Next, which refers to TaskID.
+  type: Unknown
+- contextPath: PlaybookSearch.TotalMatched
+  description: Playbooks that matched the filters.
+  type: Number
+- contextPath: PlaybookSearch.Returned
+  description: Playbooks returned (at most Limit).
+  type: Number
+- contextPath: PlaybookSearch.Scanned
+  description: Playbooks scanned.
+  type: Number
+- contextPath: PlaybookSearch.TenantTotal
+  description: Total playbooks the API reported for the query.
+  type: Number
+- contextPath: PlaybookSearch.Truncated
+  description: True when results were cut by Limit or the scan by MaxScan.
+  type: Boolean
+scripttarget: 0
+subtype: python3
+timeout: 600
+pswd: ''
+runonce: false
+dockerimage: demisto/python3:3.11.10.116949
+runas: DBotWeakRole
+engineinfo: {}
+mainengineinfo: {}

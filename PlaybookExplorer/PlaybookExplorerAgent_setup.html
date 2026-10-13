@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playbook Explorer Setup</title>
+<style>
+:root { --bg:#f7f8fa; --panel:#fff; --text:#1c2230; --muted:#5d6678; --line:#dde1e8; --accent:#fa582d;
+        --accent-soft:#fff1ec; --code:#f1f3f6; --warn:#9a5b00; --warn-soft:#fff4e0; --ok:#1e7e34; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#12151b; --panel:#1a1f28; --text:#e6e9ef;
+        --muted:#9aa3b2; --line:#2c3340; --accent:#ff7a52; --accent-soft:#2a1d19; --code:#11151c; --warn:#ffb74d;
+        --warn-soft:#2b2214; --ok:#6fcf8a; } }
+:root[data-theme="dark"] { --bg:#12151b; --panel:#1a1f28; --text:#e6e9ef; --muted:#9aa3b2; --line:#2c3340;
+        --accent:#ff7a52; --accent-soft:#2a1d19; --code:#11151c; --warn:#ffb74d; --warn-soft:#2b2214; --ok:#6fcf8a; }
+* { box-sizing:border-box }
+body { margin:0; background:var(--bg); color:var(--text); font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif }
+.wrap { max-width:960px; margin:0 auto; padding:24px 16px 64px }
+header h1 { margin:0 0 4px; font-size:1.7rem } header p { margin:0; color:var(--muted) }
+nav { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 16px; margin:20px 0 }
+nav ol { margin:0; padding-left:20px; columns:2; column-gap:32px } nav a { color:var(--text) }
+.step { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:4px 20px 16px; margin:16px 0 }
+.step h2 { font-size:1.15rem; margin:14px 0 8px } .step h3 { font-size:1rem; margin:18px 0 6px }
+.step h2 label { display:flex; gap:10px; align-items:center; cursor:pointer }
+.num { display:inline-grid; place-items:center; min-width:28px; height:28px; border-radius:50%; background:var(--accent);
+        color:#fff; font-size:.9rem }
+.step.is-done { opacity:.6 } .step.is-done .num { background:var(--ok) }
+.muted { color:var(--muted) } a { color:var(--accent) }
+code { background:var(--code); padding:1px 5px; border-radius:4px; font:.88em ui-monospace,Consolas,monospace; overflow-wrap:anywhere }
+.code { position:relative; margin:6px 0 10px }
+.code pre { margin:0; background:var(--code); border:1px solid var(--line); border-radius:8px; padding:10px 12px;
+            max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-word }
+.code pre code { background:none; padding:0 }
+.copy { position:absolute; top:6px; right:6px; font:12px system-ui; padding:3px 8px; border-radius:6px;
+        border:1px solid var(--line); background:var(--panel); color:var(--text); cursor:pointer }
+table { width:100%; border-collapse:collapse; margin:8px 0 } th,td { text-align:left; vertical-align:top;
+        border-bottom:1px solid var(--line); padding:8px 6px } th { color:var(--muted); font-weight:600; width:1%; white-space:nowrap }
+thead th { width:auto }
+.table-scroll { overflow-x:auto }
+.card { border:1px solid var(--line); border-radius:8px; margin:10px 0; padding:0 12px }
+.card summary { cursor:pointer; padding:10px 0; display:flex; flex-wrap:wrap; gap:6px; align-items:center }
+.card .name { font-weight:600; margin-right:4px }
+.tag { font-size:.75rem; background:var(--accent-soft); color:var(--accent); padding:1px 8px; border-radius:10px }
+.tag.warn { background:var(--warn-soft); color:var(--warn) }
+dl { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; margin:6px 0 } dt { color:var(--muted) } dd { margin:0 }
+ul.checks { list-style:none; padding-left:4px }
+.bar { display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap }
+.bar button { font:13px system-ui; padding:5px 10px; border-radius:6px; border:1px solid var(--line);
+              background:var(--panel); color:var(--text); cursor:pointer }
+.allset { position:fixed; left:50%; bottom:24px; transform:translate(-50%, 140%); opacity:0; pointer-events:none;
+          width:min(560px, calc(100% - 32px)); background:var(--panel); color:var(--text); border:2px solid var(--ok);
+          border-radius:14px; padding:18px 20px 16px; box-shadow:0 12px 40px rgba(0,0,0,.25); text-align:center;
+          transition:transform .45s cubic-bezier(.2,1.4,.4,1), opacity .3s; z-index:10 }
+.allset.show { transform:translate(-50%, 0); opacity:1; pointer-events:auto }
+.allset .big { font-size:2.4rem; line-height:1; margin-bottom:6px }
+.allset h2 { margin:0 0 4px; font-size:1.3rem } .allset p { margin:0 0 12px; color:var(--muted) }
+.allset button { font:13px system-ui; padding:6px 14px; border-radius:6px; border:1px solid var(--line);
+                 background:var(--bg); color:var(--text); cursor:pointer }
+.progress { font-size:.85rem; color:var(--muted); margin-top:4px }
+@media (prefers-reduced-motion: reduce) { .allset { transition:none } }
+@media (max-width:640px) { nav ol { columns:1 } th { white-space:normal } }
+</style></head>
+<body><div class="wrap">
+<header class="bar"><div><h1>Playbook Explorer &mdash; XSIAM setup</h1>
+<p>4 custom actions, 0 system, 4 scripts to upload, 0 AI prompts &middot; generated 2026-10-04 from the agent spec</p>
+<p class="progress" id="progress" aria-live="polite"></p></div>
+<button type="button" id="reset">Reset checkboxes</button></header>
+<nav><strong>Steps</strong><ol><li><a href='#prereq'>Check prerequisites</a></li><li><a href='#scripts'>Upload the scripts</a></li><li><a href='#agent'>Create the custom agent</a></li><li><a href='#actions'>Create the custom actions</a></li><li><a href='#attach'>Attach the actions to the agent</a></li><li><a href='#test'>Test in the agent chat</a></li><li><a href='#trouble'>Troubleshooting</a></li></ol></nav>
+<p class="muted">XSIAM has no import for agents or actions: everything below is created by hand in the console.
+Scripts and prompts come first because actions can only point at ones that already exist.</p>
+<section class="step" id="prereq"><h2><label><input type="checkbox" class="done" data-step="prereq"><span class="num">1</span> Check prerequisites</label></h2><p>Configure an instance of each integration and run <em>Test</em>:</p><ul><li>Core REST API</li></ul><p>Install these content packs (Marketplace) &mdash; they ship the out-of-the-box scripts the actions wrap:</p><ul><li><code>DemistoRESTAPI</code></li></ul><h3>Verify the integration instance names</h3><p>These arguments name an integration instance, and <strong>instance names differ per tenant</strong>. Check that each default matches an instance that exists in <em>this</em> tenant (<em>Settings &rarr; Integrations</em>, instance name column):</p><table><thead><tr><th>Where</th><th>Argument</th><th>Default</th><th>Change it in</th></tr></thead><tbody><tr><td>script SearchTenantPlaybooks</td><td><code>UsingInstance</code></td><td><code>Core REST API_instance_1</code></td><td>script argument default (.yml)</td></tr><tr><td>script PlaybookTaskFinder</td><td><code>UsingInstance</code></td><td><code>Core REST API_instance_1</code></td><td>script argument default (.yml)</td></tr></tbody></table><p>Confirm a name works by running this in your playground (it must not answer &ldquo;instance not found&rdquo;):</p><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>!core-api-get uri=/about using=&quot;Core REST API_instance_1&quot;</code></pre></div><p>If your instance is named differently, fix the default <strong>before</strong> creating the actions: for a script argument, edit its default value right after importing the script (next step); for an action input, set the input's default when you create the action. A wrong default makes every call fail.</p></section><section class="step" id="scripts"><h2><label><input type="checkbox" class="done" data-step="scripts"><span class="num">2</span> Upload the scripts</label></h2><p>Script actions can only point at scripts that already exist, so import these first (<em>Scripts &rarr; Import</em>, upload the <code>.yml</code>). Keep each script's name exactly as listed.</p><table><thead><tr><th>Script</th><th>Used by</th><th>Docker image</th><th>File</th></tr></thead><tbody><tr><td><code>SearchTenantPlaybooks</code></td><td>Cortex - Search Playbooks</td><td><code>demisto/python3:3.11.10.116949</code></td><td><code>SearchTenantPlaybooks.yml</code></td></tr><tr><td><code>PlaybookTaskFinder</code></td><td>Cortex - Find Playbook Tasks</td><td><code>demisto/python3:3.11.10.116949</code></td><td><code>PlaybookTaskFinder.yml</code></td></tr><tr><td><code>CreateFile</code></td><td>Cortex - Create File</td><td><code>demisto/python3:3.11.10.116949</code></td><td><code>CreateFile.yml</code></td></tr><tr><td><code>GeneratePDF</code></td><td>Cortex - Create File (PDF output, called inside CreateFile)</td><td><code>demisto/chromium:151.0.7922.11855526</code></td><td><code>GeneratePDF.yml</code></td></tr></tbody></table><h3>Duplicate these OOTB scripts</h3><p>Out-of-the-box scripts cannot be registered as actions. Open each one under <em>Scripts</em>, choose <em>Duplicate</em>, and save the copy under the exact new name:</p><table><thead><tr><th>OOTB script</th><th>Save the copy as</th><th>Used by</th></tr></thead><tbody><tr><td><code>UploadFile</code></td><td><code>UploadFileToWarRoom</code></td><td>Cortex - Upload File To War Room</td></tr></tbody></table><h3>Pull non-Python images once</h3><p>The first run of a script on a new image pulls that image, which can take minutes and time out an agent call. Run each of these once in your <strong>playground</strong> right after importing, and wait for it to finish:</p><p><code>GeneratePDF</code> &middot; <code>demisto/chromium:151.0.7922.11855526</code></p><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>!GeneratePDF Content=&quot;&lt;h1&gt;Warm-up&lt;/h1&gt;&lt;p&gt;Pulls the chromium image.&lt;/p&gt;&quot; InputFormat=html FileName=warmup.pdf</code></pre></div><p class='muted'>If the first run times out, run it again &mdash; the pull continues in the background.</p><p>After import, note each custom script's <strong>tenant id</strong> if it differs from its name, and put it in the spec's <code>id:</code> so the next build carries it.</p></section><section class="step" id="agent"><h2><label><input type="checkbox" class="done" data-step="agent"><span class="num">3</span> Create the custom agent</label></h2>
+<p><em>Agentic Assistant Hub &rarr; Agents &rarr; New agent.</em> Fill in:</p>
+<table><tbody>
+<tr><th>Name</th><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Playbook Explorer</code></pre></div></td></tr>
+<tr><th>Description</th><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>## Role
+You are the Playbook Explorer assistant for the SOC engineering team in Cortex XSIAM. You answer questions
+about the playbooks in this tenant -- which exist, what they do, what they use, who changed them -- by calling
+the actions below, and on request you write reports (HTML, Markdown, CSV, SVG charts, Mermaid diagrams; PDF or
+DOCX only when asked for by name) into an issue or case war room. You are read-only for playbooks: you never create, edit, run, or delete them.
+
+## How to handle every request
+1. Work out what is being asked: find playbooks, describe one playbook, find tasks, or produce a report.
+2. Turn every condition in the request into an argument of Cortex - Search Playbooks (see its description
+   for the recipes). Combine conditions in ONE call: all arguments are ANDed.
+3. Ask for only the fields you need (ReturnFields or Verbosity) and the task detail you need (TaskDetail).
+4. If TotalMatched is larger than Returned, say so and offer to narrow or raise Limit.
+5. Answer in the Output format from the Guidelines.
+6. Offer a report file only when the answer is long (a playbook walkthrough, or 10+ playbooks), or when asked.
+
+## Recognise the identifier
+- Text in quotes, or a Title-Case phrase with &quot; - &quot; (e.g. &quot;Phishing - Generic v3&quot;) -&gt; a playbook name:
+  Name=&lt;text&gt; NameMatch=exact. If exact returns nothing, retry once with NameMatch=contains. If that
+  also returns nothing, it may be an out-of-the-box playbook: retry once more with Origin=system.
+- A UUID or a short id-like string -&gt; PlaybookID.
+- A lowercase word with dashes (ad-disable-account, setIncident) -&gt; a command: UsesCommand.
+- A CamelCase word (SetGridField, ParseEmailFilesV2) -&gt; an automation: UsesScript.
+- A product name (Active Directory, CrowdStrike, ServiceNow) -&gt; UsesIntegration.
+- A topic (&quot;phishing&quot;, &quot;brute force&quot;) -&gt; Keyword.
+- &quot;issue 1234&quot; / &quot;alert 1234&quot; -&gt; an issue (alert) ID, TargetType=Issue, TargetID=1234.
+  &quot;case 12&quot; / &quot;incident 12&quot; / &quot;INCIDENT-12&quot; -&gt; a case (incident), TargetType=Case, TargetID=12 (the
+  INCIDENT- prefix is added for you). Never swap them: case 12 and issue 12 are different objects.
+
+## Action map
+### Find and list playbooks
+- Find, list, count or filter playbooks by any property -&gt; Cortex - Search Playbooks
+- Job playbooks -&gt; Cortex - Search Playbooks with Tags=job,jobs,operational
+- Deprecated, recently changed, by pack or author -&gt; Cortex - Search Playbooks. It searches CUSTOM
+  playbooks by default; add Origin=system for out-of-the-box only, or Origin=all for both, only when
+  the analyst asks for out-of-the-box or all playbooks (those scans take minutes).
+### Understand one playbook
+- What does playbook X do / walk me through it / what are its steps -&gt; Cortex - Search Playbooks with
+  Name=X NameMatch=exact TaskDetail=flow, then explain it by following Next from the start task, including
+  every branch and error path (see &quot;Flows and diagrams&quot; in the Guidelines).
+- Draw playbook X / a flowchart of X -&gt; Cortex - Search Playbooks (TaskDetail=flow), then the same Mermaid
+  (built from Next) through Cortex - Create File twice - OutputFormat=html (the drawn chart) and
+  OutputFormat=same (the .mmd source) - and Cortex - Upload File To War Room for each. PDF only when the
+  analyst says PDF (see &quot;File formats&quot; in the Guidelines).
+- What does X use (scripts, commands, sub-playbooks, integrations, inputs, outputs) -&gt; Cortex - Search
+  Playbooks with Verbosity=detailed.
+### Tasks across playbooks
+- Which playbooks use X -&gt; Cortex - Search Playbooks (UsesCommand / UsesScript / UsesIntegration).
+- Every matching TASK with its inputs (where exactly is command X called, with what arguments) -&gt;
+  Cortex - Find Playbook Tasks. It returns the task rows as data you can read and summarise.
+### Error handling
+- Which tasks have no error handling (an error stops the playbook) -&gt; Cortex - Find Playbook Tasks with
+  OnError=Stop plus what to look at (Brand=&lt;integration&gt; or Automation=&lt;command&gt;). Tasks that continue or
+  take an error path: OnError=Continue / OnError=Error path.
+- Which playbooks handle errors at all / how many tasks do -&gt; Cortex - Search Playbooks with
+  ReturnFields=ErrorHandledTasks (0 means any task error stops the playbook).
+- For one playbook: TaskDetail=flow and read OnError on each task.
+### Reports and files
+- Any file (HTML, Markdown, CSV, JSON, SVG chart, Mermaid diagram; PDF / DOCX when asked) -&gt; two calls,
+  always in this order:
+  1. Cortex - Create File: you write the content (HTML, Markdown, CSV, JSON, SVG, or a Mermaid /
+     draw.io / Excalidraw diagram) from action results, as plain text with real line breaks - never a
+     JSON string; it returns CreateFile.FileID.
+  2. Cortex - Upload File To War Room: entryID = that CreateFile.FileID, incID = the issue ID as given,
+     or INCIDENT-&lt;n&gt; for a case, body = {&quot;fileName&quot;: &quot;&lt;file name with extension&gt;&quot;, &quot;fileComment&quot;: &quot;&lt;note&gt;&quot;}.
+     Only then can the analyst see the file.
+  Get the data first. Ask for the issue or case ID if not given. Never a playground.
+
+## Full checks
+For &quot;tell me everything about playbook X&quot;: one call to Cortex - Search Playbooks with Name=X
+NameMatch=exact Verbosity=detailed TaskDetail=flow. Do not make separate calls per field.</code></pre></div></td></tr>
+<tr><th>Guidelines</th><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>## Evidence
+- Use only what the actions return. Never invent playbook names, tasks, commands, or authors.
+- Every fact comes from an action; name it in the Source column. A report contains only returned data.
+- A failed action -&gt; say it failed and why (the error text), retry at most once, never report &quot;no playbooks&quot;.
+- Zero matches is a valid answer: say &quot;No playbooks matched&quot; and list the filters you used.
+
+## Status values (use exactly these)
+CUSTOM / SYSTEM, DEPRECATED / ACTIVE, FOUND / NOT FOUND, UNKNOWN
+
+## Efficiency
+- One Cortex - Search Playbooks call per question; combine filters instead of calling per filter.
+- TaskDetail=flow only for 1-3 playbooks (it is large).
+- Leave Origin at custom. Origin=system / all scan every out-of-the-box playbook and take minutes: only when
+  asked for out-of-the-box / all, or a named playbook is not found among custom ones. Say it may take minutes.
+- Over 8 action calls: report what you have and ask whether to continue.
+
+## Safety and scope
+- Read-only for playbooks. Never change, run, or delete them; if asked, say it is out of scope.
+- The only write: Cortex - Upload File To War Room adds one file (made with Cortex - Create File) to the issue
+  or case the analyst named, only when they ask for a file or accept your offer.
+- Never write base64; write HTML, Markdown, CSV, JSON, SVG or Mermaid and let Cortex - Create File build PDF / DOCX.
+
+## File formats
+- Default: report -&gt; html; flowchart -&gt; html + .mmd (same); chart -&gt; svg; rows -&gt; csv.
+- PDF only when the analyst says &quot;PDF&quot;, DOCX only for Word; &quot;report&quot;, &quot;file&quot;, &quot;draw&quot;, &quot;export&quot; are not. Never
+  choose or offer PDF yourself: it splits wide flowcharts and long reports across pages.
+
+## Flows and diagrams
+- Tasks are listed in reading order only. The flow is Next (by TaskID); never order or connect tasks by list position.
+- Next: &quot;-&gt; 3&quot; one target; &quot;-&gt; (1, 3)&quot; several targets, all run; &quot;yes -&gt; (4, 6); else -&gt; 5&quot; one entry per
+  branch; &quot;error -&gt; 27&quot; error path; &quot;&quot; end. OnError: Stop, Continue or Error path.
+- Flowcharts: Mermaid only (flowchart TD), never your own HTML or JavaScript. Follow the Mermaid rules in Cortex -
+  Create File: a T&lt;TaskID&gt;[&quot;name&quot;] node per task (never [&#x27;name&#x27;] or [&quot;&quot;]), one edge per Next target.
+- File content: plain text with real line breaks, never a JSON string.
+
+## Output format
+&lt;One-line answer, e.g. &quot;12 custom playbooks were modified in the last 7 days.&quot;&gt;
+
+| Playbook | Origin | Modified | Modified By | Key detail |
+|---|---|---|---|---|
+
+Filters used: &lt;arguments passed&gt;. Source: Cortex - Search Playbooks.
+
+- Walkthrough: follow Next from the start task and name tasks, not positions. Each branch with the task it
+  leads to (&quot;If yes -&gt; Isolate Endpoint (task 12), else -&gt; Close Alert (task 15)&quot;); say which tasks run
+  together; mention error paths; name what each task runs.
+- After a file: &quot;&lt;file name&gt; is attached to &lt;issue/case&gt; &lt;ID&gt;.&quot; one line per file.
+- Raw JSON only when explicitly requested.</code></pre></div></td></tr>
+<tr><th>Conversation starters</th><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Which custom playbooks were modified in the last 7 days?</code></pre></div><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>List all job playbooks</code></pre></div><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Walk me through what our phishing triage playbook does</code></pre></div><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Create a report of the playbooks that use ad-disable-account and attach it to issue 1234</code></pre></div></td></tr>
+<tr><th>Visibility</th><td>public</td></tr>
+</tbody></table>
+<p class="muted">Save it now; actions are attached in a later step.</p></section><section class="step" id="actions"><h2><label><input type="checkbox" class="done" data-step="actions"><span class="num">4</span> Create the custom actions</label></h2><p><em>Agentic Assistant Hub &rarr; Actions &rarr; New action</em>, one per card. Use the exact name &mdash; the agent prompt refers to actions by name.</p>
+<details class="card" id="action-cortex-search-playbooks">
+  <summary><span class="name">Cortex - Search Playbooks</span>
+    <span class="tag">script</span><span class="tag">SearchTenantPlaybooks</span>
+    </summary>
+  <dl>
+    <dt>Type</dt><dd>script &rarr; <code>SearchTenantPlaybooks</code></dd>
+    <dt>Source</dt><dd>custom script &middot; id <code>08c8fefa-182a-48e7-89df-0ae0350b1048</code></dd>
+    <dt>Sensitive</dt><dd>No</dd>
+  </dl>
+  <p><strong>Inputs</strong> (expose exactly these):</p><div class="code"><pre><code>Keyword (optional): Free text found in the SearchIn fields. Comma-separate for any-of. Example: phishing,credential
+SearchIn (optional): Fields Keyword searches: any of name, description, tags, tasks. [default: name,description]
+Name (optional): Playbook name. Comma-separate for any-of.
+NameMatch (optional): contains | exact | regex (case-insensitive). [default: contains]
+PlaybookID (optional): Exact playbook IDs, comma-separated.
+Description (optional): Text the playbook description must contain (substring).
+Tags (optional): Playbook tags, comma-separated. Job playbooks: job,jobs,operational.
+TagsMatch (optional): any | all. [default: any]
+PackName (optional): Content pack name (substring).
+Origin (optional): custom (default) | system | all. system and all scan every out-of-the-box playbook and can take minutes; use only when asked for OOTB or all playbooks. [default: custom]
+Deprecated (optional): exclude | include | only. [default: exclude]
+UsesScript (optional): Automation a task runs (substring), e.g. SetGridField.
+UsesCommand (optional): Integration command or builtin a task runs (substring), e.g. ad-disable-account.
+UsesSubPlaybook (optional): Sub-playbook a task calls (substring).
+UsesIntegration (optional): Integration brand a task uses (substring), e.g. Active Directory.
+TaskName (optional): Text in any task name or task description.
+ModifiedFrom (optional): Modified at or after: &#x27;7 days ago&#x27;, &#x27;24 hours ago&#x27; or ISO 8601 (UTC).
+ModifiedTo (optional): Modified at or before: relative or ISO 8601 (UTC).
+ModifiedBy (optional): User who last modified the playbook (substring).
+Verbosity (optional): summary | detailed (adds Scripts, Commands, SubPlaybooks, Integrations, Inputs, Outputs). [default: summary]
+ReturnFields (optional): Extra fields to return; ID, Name, Description, Tags, System, PackName, Deprecated, Modified and ModifiedBy always come back. Overrides Verbosity. TaskCount, ErrorHandledTasks, PackID, Hidden, Version, Scripts, Commands, SubPlaybooks, Integrations, Inputs, Outputs.
+TaskDetail (optional): none | names | flow (every task: TaskID, Type, Name, Description, Runs, Inputs, Next, OnError). [default: none]
+SortBy (optional): name | modified. [default: name]
+SortOrder (optional): asc | desc. Default asc for name, desc for modified.
+Limit (optional): Maximum playbooks returned. [default: 50]</code></pre></div>
+  
+  <p><strong>Example prompts</strong></p><ul><li>Which custom playbooks were changed in the last week?</li><li>List all job playbooks</li><li>Walk me through what this playbook does</li><li>Which playbooks use the ad-disable-account command?</li><li>Which of our playbooks have no error handling?</li></ul>
+  <p><strong>Description</strong> (paste into the action's description field):</p><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Searches the playbooks in this tenant with any combination of filters and returns the matches, optionally with each playbook&#x27;s full task flow. Read-only.
+
+Use for ANY question about which playbooks exist, what a playbook does or uses, or who changed it. Do NOT use it for individual tasks and their inputs (use Cortex - Find Playbook Tasks) or to create a file (use Cortex - Create File, then Cortex - Upload File To War Room).
+
+How to fill inputs: pass ONLY the arguments the question needs. Every argument is optional; all given ones are ANDed. List values are comma-separated and match any-of. Recipes:
+- Topic search (&quot;playbooks about phishing&quot;): Keyword=phishing (searches name and description). Add SearchIn=name,description,tasks to also match task names.
+- Name only: Name=&lt;text&gt;. Known full name: Name=&lt;name&gt;, NameMatch=exact. Starts with: Name=^&lt;text&gt;, NameMatch=regex.
+- Job playbooks: Tags=job,jobs,operational. Every tag required: TagsMatch=all.
+- Origin: custom playbooks are searched by default, so do not pass Origin for them. Out-of-the-box only: Origin=system. Both: Origin=all. system and all take minutes: use them only when the analyst asks for out-of-the-box or all playbooks, or a named playbook is not found among custom ones.
+- Deprecated: Deprecated=only. Include them in lists: Deprecated=include.
+- Changed recently: ModifiedFrom=&quot;7 days ago&quot;, SortBy=modified. Window: add ModifiedTo. By person: ModifiedBy=&lt;user&gt;.
+- Uses something: automation -&gt; UsesScript, command/builtin -&gt; UsesCommand, sub-playbook -&gt; UsesSubPlaybook, product -&gt; UsesIntegration.
+- Text in the description only: Description=&lt;text&gt;.
+- Explain or draw a playbook: Name=&lt;name&gt;, NameMatch=exact, TaskDetail=flow. Task names only: TaskDetail=names.
+- Error handling: ReturnFields=ErrorHandledTasks (count of tasks set to Continue or Error path; 0 = any task error stops the playbook).
+- Dependencies: Verbosity=detailed. Short lists: pass no ReturnFields (the always-returned fields are enough).
+- Counts (&quot;how many&quot;): Limit=1, then read TotalMatched.
+Never invent tag, pack or user values; use what the analyst said. Keep Limit at 50 unless asked for more.
+
+How to read the result: PlaybookSearch.Playbook holds one row per playbook: ID, Name, Description, Tags, System (true = out-of-the-box, false = custom), PackName, Deprecated, Modified, ModifiedBy, plus requested fields. TotalMatched is the full match count; Returned is how many came back; Truncated=true means there are more (raise Limit or narrow).
+With TaskDetail=flow, Tasks has one row per task: TaskID, Type (start, regular, condition, playbook, title), Name, Description, Runs (&quot;command: ad-get-user (Active Directory Query v2)&quot;, &quot;script: X&quot;, &quot;playbook: Y&quot;), Inputs, Next and OnError. Rows are in reading order only (from the start task); the flow is Next, which refers to TaskID:
+- &quot;-&gt; 3&quot;: one next task. &quot;-&gt; (1, 3)&quot;: several next tasks of one branch, all of them run.
+- &quot;yes -&gt; (4, 6); else -&gt; 5&quot;: a condition, one entry per branch separated by &quot;;&quot;; else is the default branch.
+- &quot;-&gt; 41; error -&gt; 27&quot;: error path, taken when the task fails. &quot;&quot;: the end of the flow.
+OnError is what happens when the task fails: Stop (the playbook stops), Continue, or Error path; empty for start and title tasks.
+
+After calling: zero matches -&gt; say &quot;No playbooks matched&quot; and list the filters; if NameMatch=exact found nothing, retry once with NameMatch=contains, then once with Origin=system (it may be out-of-the-box). An error -&gt; report it; do not claim no playbooks exist. To explain a playbook, follow Next from the start task: every branch with the task it leads to, parallel tasks together, error paths, and what each task runs. To draw it, use the Mermaid rules in the Guidelines.
+
+Safety: read-only; it never changes playbooks.</code></pre></div>
+</details>
+<details class="card" id="action-cortex-find-playbook-tasks">
+  <summary><span class="name">Cortex - Find Playbook Tasks</span>
+    <span class="tag">script</span><span class="tag">PlaybookTaskFinder</span>
+    </summary>
+  <dl>
+    <dt>Type</dt><dd>script &rarr; <code>PlaybookTaskFinder</code></dd>
+    <dt>Source</dt><dd>custom script &middot; id <code>f256e677-ff76-4849-ac40-346cf7463cbb</code></dd>
+    <dt>Sensitive</dt><dd>No</dd>
+  </dl>
+  <p><strong>Inputs</strong> (expose exactly these):</p><div class="code"><pre><code>TaskName (optional): Match against the task name.
+Automation (optional): Match against the automation, integration command or builtin name, e.g. ad-disable-account.
+Brand (optional): Match against the integration brand (Script for automations).
+OnError (optional): Only tasks with this error handling: Stop (an error stops the playbook) | Continue | Error path. Always exact.
+MatchMode (optional): contains | exact | regex (TaskName, Automation, Brand). [default: contains]
+IncludeSystem (optional): true to also search out-of-the-box playbooks. [default: false]
+ExcludeTags (optional): Skip playbooks with these tags. Pass none to include job playbooks. [default: jobs,job,operational]
+ExcludeNames (optional): Skip playbooks whose name contains these. Pass none to skip nothing. [default: shift,roster]</code></pre></div>
+  
+  <p><strong>Example prompts</strong></p><ul><li>Where is ad-disable-account called and with what arguments?</li><li>Show every task that uses the ServiceNow integration</li><li>Which Cortex Core - IR tasks stop the playbook when they fail?</li></ul>
+  <p><strong>Description</strong> (paste into the action's description field):</p><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Finds every playbook TASK that matches a task name, an automation/command, an integration brand, or its error handling, and returns the tasks with their inputs, next tasks and error handling as data (PlaybookTaskFinder.Task). Read-only.
+
+Use when the question is about tasks rather than playbooks: where exactly a command runs, with what arguments, which tasks use an integration, which tasks have no error handling. For &quot;which playbooks use X&quot; prefer Cortex - Search Playbooks (UsesCommand / UsesScript / UsesIntegration); to explain or draw one whole playbook use Cortex - Search Playbooks with TaskDetail=flow. It does not create files: for a spreadsheet or document, pass its rows to Cortex - Create File (then Cortex - Upload File To War Room).
+
+How to fill inputs: at least one of TaskName, Automation, Brand, OnError is required (ask if none is given); several are ANDed. Commands and automations go in Automation. Error handling: OnError=Stop finds tasks where an error stops the playbook - combine it with Brand or Automation (OnError alone lists every task). Custom playbooks only by default: IncludeSystem=true when out-of-the-box playbooks are wanted. Job, shift and roster playbooks are skipped by default: to include them pass ExcludeTags=none and ExcludeNames=none.
+
+How to read the result: one PlaybookTaskFinder.Task row per task: PlaybookName, PlaybookID, TaskID, TaskName, TaskType, Automation, Brand (resolved for unpinned commands; Script for automations), Description, TaskInputs (&quot;arg = value&quot; lines; ${root.accessor} means a context value), OnError (Stop, Continue, Error path; empty for start and title tasks) and NextTasks - by TaskID within that playbook: &quot;-&gt; 3&quot; one target, &quot;-&gt; (1, 3)&quot; several targets of one branch (all run), &quot;yes -&gt; (4, 6); else -&gt; 5&quot; one entry per branch separated by &quot;;&quot;, &quot;error -&gt; 27&quot; the error path, &quot;&quot; the end. MatchedTasks = count; 0 is a valid answer.
+
+After calling: summarise by playbook in a table. For a file of the tasks, call Cortex - Create File with the rows as JSON (InputFormat=json, OutputFormat=csv or html; docx / pdf only when asked by name), then Cortex - Upload File To War Room with its CreateFile.FileID and the issue or case ID.
+
+Safety: read-only.</code></pre></div>
+</details>
+<details class="card" id="action-cortex-create-file">
+  <summary><span class="name">Cortex - Create File</span>
+    <span class="tag">script</span><span class="tag">CreateFile</span>
+    </summary>
+  <dl>
+    <dt>Type</dt><dd>script &rarr; <code>CreateFile</code></dd>
+    <dt>Source</dt><dd>custom script &middot; id <code>168448b6-fe84-4472-95d3-f4dc3ca9ff9b</code></dd>
+    <dt>Sensitive</dt><dd>No</dd>
+  </dl>
+  <p><strong>Inputs</strong> (expose exactly these):</p><div class="code"><pre><code>Content (required): What you wrote, as plain text with real line breaks (not a JSON string): HTML, Markdown, CSV, JSON, SVG markup, or diagram source (Mermaid, draw.io XML, Excalidraw scene JSON).
+InputFormat (optional): auto | markdown | html | text | csv | json | svg | mermaid | drawio | excalidraw. auto detects SVG, draw.io, HTML, Excalidraw, JSON, Mermaid, else Markdown. [default: auto]
+OutputFormat (optional): html | md | csv | json | svg | txt | same (as-is, e.g. the .mmd source) | pdf / docx (only when the analyst asks for PDF / Word by name). [default: same]
+FileName (optional): File name without extension, e.g. Playbook_Report_Phishing. [default: report]
+Title (optional): Document title (skipped if the content opens with its own h1).
+Theme (optional): PDF theme: clean | corporate | minimal.
+Orientation (optional): PDF: portrait | landscape. landscape for wide tables and wide flowcharts.
+IncludeTOC (optional): PDF: true adds a table of contents (3+ sections).</code></pre></div>
+  
+  <p><strong>Example prompts</strong></p><ul><li>Create a PDF of this walkthrough for issue 4521</li><li>Make a bar chart of task counts per playbook</li><li>Draw the phishing playbook as a flowchart</li><li>Export these tasks as a Word document</li></ul>
+  <p><strong>Description</strong> (paste into the action's description field):</p><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Builds a file from content you write -- as-is, as an HTML page, or (only when asked by name) converted to PDF or DOCX -- and returns its details, above all CreateFile.FileID. Step 1 of 2: the file is created in this chat run; deliver it with Cortex - Upload File To War Room.
+
+Use for every file the analyst asks for: HTML reports, PDF/DOCX when asked by name, CSV/Markdown/JSON exports, SVG charts, Mermaid / draw.io / Excalidraw diagrams. Get the data first (Cortex - Search Playbooks / Cortex - Find Playbook Tasks); put only returned data in the file. Do NOT use it to deliver a file.
+
+How to fill inputs:
+- Content is plain text with real line breaks and normal quotes - never a JSON string with \n and \&quot; in it, never wrapped in &quot;...&quot; or [...]. (The script repairs an escaped page, but write it plainly.)
+- Content: write HTML for reports: &lt;h1&gt; title; a summary &lt;p&gt; (what, how many, filters, date); a &lt;table&gt; with &lt;thead&gt;; per playbook an &lt;h2&gt;, description, the tasks in flow order (&lt;strong&gt;name&lt;/strong&gt;, what it runs in &lt;code&gt;, each branch with the task it leads to as a nested &lt;ul&gt;). Style with one &lt;style&gt; block (table{border-collapse:collapse;width:100%} th{background:#0b3d91;color:#fff} td,th{border:1px solid #d0d7de;padding:6px}). No &lt;script&gt;: nothing may be drawn with JavaScript (scripts are removed for PDF).
+- Charts: write SVG (&lt;svg xmlns=... width height viewBox&gt;, &lt;rect&gt; bars, &lt;text&gt; labels, a title). Send it alone (OutputFormat=svg) or inside the HTML report.
+- Flowcharts (task flow, decision tree): always Mermaid, InputFormat=mermaid, as TWO files from the same source and FileName: OutputFormat=html (the drawn chart, one page) and OutputFormat=same (the .mmd source); upload both. pdf (Orientation=landscape, plus the .mmd) only when the analyst says PDF. Build it from Next, never list order:
+  flowchart TD
+      T0[&quot;Start&quot;]
+      T0 --&gt; T23
+      T23[&quot;Is the endpoint known?&quot;]
+      T23 -- &quot;yes&quot; --&gt; T13
+      T23 -- &quot;else&quot; --&gt; T10
+      T41 -- &quot;PID&quot; --&gt; T43
+      T41 -- &quot;PID&quot; --&gt; T45
+      T13 -- &quot;error&quot; --&gt; T27
+  One node per task T&lt;TaskID&gt;[&quot;&lt;task name&gt;&quot;], double quotes only - never [&#x27;...&#x27;] (a ( ) inside breaks it) or [&quot;&quot;] (no name -&gt; T0[&quot;Start&quot;]); one edge per Next target (&quot;-&gt; (43, 45)&quot; is two), every task and target present; label named branches, else and error; quotes in a label as #quot;; no trailing commas. If the analyst gives draw.io XML or an Excalidraw scene, pass it unchanged (InputFormat=drawio / excalidraw). Diagrams can be html, same (the source file) or, when asked, pdf.
+- Tables of rows: the action&#x27;s rows as JSON (InputFormat=json).
+- Markdown is fine for simple docs. Escape &lt;, &gt; and &amp; in names inside HTML.
+- OutputFormat: html for reports, html + same for flowcharts, svg for charts, csv for rows. pdf ONLY when the analyst says PDF, docx only for Word; &quot;report&quot;, &quot;file&quot; or &quot;export&quot; alone means html.
+- FileName: subject-based, e.g. Playbook_Report_Job_Playbooks. Title: the report title.
+- PDF (when asked): Theme=corporate; IncludeTOC=true for 3+ sections.
+- Never base64: you cannot write binary.
+
+How to read the result: CreateFile.FileID identifies the new file; CreateFile.FileName is its name with extension (use it as fileName in the upload body). &quot;GeneratePDF returned no file&quot; -&gt; PDF is not set up, offer html. &quot;The diagram could not be drawn: Parse error ...&quot; -&gt; fix the Mermaid against the rules once and retry, else deliver html + .mmd. &quot;Content arrived JSON-escaped or wrapped and was unescaped first&quot; -&gt; the file is fine; send plain text next time.
+
+After calling: immediately call Cortex - Upload File To War Room with entryID = CreateFile.FileID from THIS result, the issue or case ID, and body with fileName = CreateFile.FileName. If you created several files (a flowchart&#x27;s .html and .mmd), upload each one with its own CreateFile.FileID and CreateFile.FileName. Do not tell the analyst the file is ready until the upload succeeded.
+
+Safety: only creates a file in this chat run; changes nothing else.</code></pre></div>
+</details>
+<details class="card" id="action-cortex-upload-file-to-war-room">
+  <summary><span class="name">Cortex - Upload File To War Room</span>
+    <span class="tag">script</span><span class="tag">UploadFileToWarRoom</span>
+    </summary>
+  <dl>
+    <dt>Type</dt><dd>script &rarr; <code>UploadFileToWarRoom</code></dd>
+    <dt>Source</dt><dd>duplicate of OOTB script UploadFile (Packs/DemistoRESTAPI/Scripts/UploadFile/UploadFile.yml)</dd>
+    <dt>Sensitive</dt><dd>No</dd>
+  </dl>
+  <p><strong>Inputs</strong> (expose exactly these):</p><div class="code"><pre><code>entryID (required): File entry ID. [options: ; comma-separated list]
+incID (required): Incident ID to upload the file to.
+target (optional): Where to upload the file
+- Available options are:
+- `war room entry`: the file will be uploaded as war room entry.
+- `incident attachment`: the file will be uploaded as incident attachment.
+- default are `war room entry`. [default: war room entry; options: war room entry, incident attachment]
+body (required): JSON with the file name and a comment, e.g. {&quot;fileName&quot;: &quot;Playbook_Report.html&quot;, &quot;fileComment&quot;: &quot;Playbook report&quot;}. Without it the file has no name or extension in the war room.</code></pre></div>
+  
+  <p><strong>Example prompts</strong></p><ul><li>Attach the report to issue 4521</li><li>Upload that report to case 12</li></ul>
+  <p><strong>Description</strong> (paste into the action's description field):</p><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Copies a file created in this chat run into the war room of an issue (alert) or case (incident), where the analyst can open and download it. Step 2 of 2, right after Cortex - Create File.
+
+Use right after Cortex - Create File succeeds, and when the analyst asks to attach or upload a file you created. Do NOT use it to create files.
+
+Before calling: you need CreateFile.FileID and CreateFile.FileName from the Cortex - Create File result, and the issue or case ID. If the analyst has not named one, ask once: &quot;Which issue or case ID should I attach it to?&quot; Never guess an ID, never use a playground ID.
+
+How to fill inputs:
+- entryID: CreateFile.FileID exactly as returned by Cortex - Create File. Never invent or edit it.
+- incID: issue (alert) -&gt; the ID as given, e.g. 4521. Case (incident) -&gt; INCIDENT-&lt;n&gt;, e.g. case 12 -&gt; INCIDENT-12. Never swap them: case 12 and issue 12 are different objects.
+- target: war room entry (default). incident attachment only if the analyst asks for an attachment.
+- body: always pass it, as JSON with fileName and fileComment: {&quot;fileName&quot;: &quot;&lt;CreateFile.FileName&gt;&quot;, &quot;fileComment&quot;: &quot;&lt;one-line note&gt;&quot;}, e.g. {&quot;fileName&quot;: &quot;Playbook_Report_Job_Playbooks.html&quot;, &quot;fileComment&quot;: &quot;Playbook report - job playbooks&quot;}. fileName must include the extension.
+
+How to read the result: &quot;File uploaded successfully&quot; -&gt; done. &quot;Could not find investigation&quot; -&gt; wrong ID, a playground, or a case sent without INCIDENT-; ask for the right ID. &quot;There was an issue uploading the file&quot; -&gt; report the error.
+
+After calling: &quot;&lt;file name&gt; is attached to &lt;issue/case&gt; &lt;ID&gt;.&quot; in one line. Retry at most once.
+
+Safety: only adds the file to the issue or case the analyst named.
+
+In case of uploading to a Case/Incident, add the INCIDENT- prefix to the ID (case 12 -&gt; incID=INCIDENT-12); for an Issue/Alert use the ID with no prefix (issue 4521 -&gt; incID=4521).
+The body parameter has to be passed with fileName and fileComment, e.g. body={&quot;fileName&quot;: &quot;report.html&quot;, &quot;fileComment&quot;: &quot;Playbook report&quot;}; otherwise the uploaded file has no file name or extension in the case or issue war room.</code></pre></div>
+</details></section><section class="step" id="attach"><h2><label><input type="checkbox" class="done" data-step="attach"><span class="num">5</span> Attach the actions to the agent</label></h2><p>Open <strong>Playbook Explorer</strong> &rarr; Actions, and add all 4:</p><ul class='checks'><li><label><input type='checkbox'> Cortex - Search Playbooks</label></li><li><label><input type='checkbox'> Cortex - Find Playbook Tasks</label></li><li><label><input type='checkbox'> Cortex - Create File</label></li><li><label><input type='checkbox'> Cortex - Upload File To War Room</label></li></ul><p>Then set access (roles / users) and save.</p></section><section class="step" id="test"><h2><label><input type="checkbox" class="done" data-step="test"><span class="num">6</span> Test in the agent chat</label></h2>
+<p>Open the agent chat, pick <strong>Playbook Explorer</strong>, and send each prompt. For every answer, check the
+action trace: the right action ran, with sensible arguments, and the answer uses only what the action returned.</p>
+<table><thead><tr><th>Prompt</th><th>Expected</th><th>OK</th></tr></thead><tbody><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Which custom playbooks were modified in the last 7 days?</code></pre></div></td><td>Cortex - Search Playbooks with ModifiedFrom=7 days ago, SortBy=modified (no Origin - custom is the default)</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>List all job playbooks</code></pre></div></td><td>Cortex - Search Playbooks with Tags=job,jobs,operational</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Walk me through what our phishing triage playbook does</code></pre></div></td><td>Cortex - Search Playbooks with Name=..., TaskDetail=flow; a walkthrough that follows Next from the start task, names each branch with the task it leads to, says which tasks run in parallel, and mentions error paths</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Draw the phishing triage playbook as a flowchart for issue &lt;your issue ID&gt;</code></pre></div></td><td>Cortex - Search Playbooks (TaskDetail=flow), then Cortex - Create File twice with the same Mermaid as plain text (flowchart TD, T&lt;TaskID&gt;[&quot;...&quot;] double-quoted nodes, no empty labels, one edge per Next target, else / error labels; InputFormat=mermaid) - OutputFormat=html and OutputFormat=same - and Cortex - Upload File To War Room for each (.html and .mmd); NO pdf; every branch of a &quot;-&gt; (a, b)&quot; Next appears as its own arrow</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Draw the phishing triage playbook as a flowchart PDF for issue &lt;your issue ID&gt;</code></pre></div></td><td>Cortex - Create File with OutputFormat=pdf, Orientation=landscape, plus OutputFormat=same for the .mmd; both uploaded (PDF only because the prompt says PDF)</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Create a report of the job playbooks and attach it to issue &lt;your issue ID&gt;</code></pre></div></td><td>Cortex - Search Playbooks, then Cortex - Create File with HTML content and OutputFormat=html (not pdf - the prompt does not say PDF), then Cortex - Upload File To War Room</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Which Cortex Core - IR tasks stop the playbook when they fail?</code></pre></div></td><td>Cortex - Find Playbook Tasks with Brand=Cortex Core - IR, OnError=Stop; a table by playbook</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Which custom playbooks have no error handling at all?</code></pre></div></td><td>Cortex - Search Playbooks with ReturnFields=ErrorHandledTasks; lists the playbooks with ErrorHandledTasks=0</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Which playbooks use the ad-disable-account command?</code></pre></div></td><td>Cortex - Search Playbooks with UsesCommand=ad-disable-account</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Show every task that runs setIncident and what it sets</code></pre></div></td><td>Cortex - Find Playbook Tasks with Automation=setIncident; a table built from PlaybookTaskFinder.Task (TaskInputs)</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Create a PDF report of the job playbooks and attach it to issue &lt;your issue ID&gt;</code></pre></div></td><td>Cortex - Search Playbooks, then Cortex - Create File (OutputFormat=pdf), then Cortex - Upload File To War Room (entryID=CreateFile.FileID, incID=your issue ID, body with fileName and fileComment); the PDF appears in that issue&#x27;s war room</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Put a bar chart of playbook task counts in case &lt;your case ID&gt;</code></pre></div></td><td>Cortex - Search Playbooks (ReturnFields=TaskCount), then Cortex - Create File with SVG content (OutputFormat=svg), then Cortex - Upload File To War Room with incID=INCIDENT-&lt;your case ID&gt;</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Export the setIncident tasks as a Word document for issue &lt;your issue ID&gt;</code></pre></div></td><td>Cortex - Find Playbook Tasks, then Cortex - Create File (InputFormat=json or markdown, OutputFormat=docx), then Cortex - Upload File To War Room (incID=your issue ID)</td><td><input type='checkbox' aria-label='passed'></td></tr><tr><td><div class="code"><button class="copy" type="button" aria-label="Copy">Copy</button><pre><code>Which out-of-the-box playbooks are deprecated?</code></pre></div></td><td>Cortex - Search Playbooks with Origin=system, Deprecated=only; warns that it may take a few minutes</td><td><input type='checkbox' aria-label='passed'></td></tr></tbody></table>
+<h3>Also try</h3><ul>
+<li>A vague prompt (&ldquo;check this&rdquo;) &mdash; the agent should ask one clarifying question, not guess.</li>
+<li>Something out of scope (e.g. &ldquo;delete this&rdquo;) &mdash; it should refuse and say what it can do.</li>
+<li>A value that does not exist &mdash; it should say NOT FOUND, not invent a result.</li>
+
+</ul></section><section class="step" id="trouble"><h2><label><input type="checkbox" class="done" data-step="trouble"><span class="num">7</span> Troubleshooting</label></h2><table><thead><tr><th>Symptom</th><th>Fix</th></tr></thead><tbody><tr><td>Every search is slow (minutes)</td><td>The Search Playbooks action&#x27;s Origin input default must be custom, not all. all/system scan every out-of-the-box playbook.</td></tr><tr><td>Upload File To War Room fails with &quot;Could not find investigation&quot;</td><td>The incID is a playground, a wrong ID, or the wrong form - a case must be INCIDENT-&lt;n&gt;, an issue the ID as is. Files can only go to an issue (alert) or case (incident) the Core REST API key can see; a playground only accepts writes from its owner.</td></tr><tr><td>Upload File To War Room cannot find the entry</td><td>The agent passed an entry ID it did not get from Cortex - Create File in the same chat. Check that Create File&#x27;s outputs include CreateFile.FileID (step 5) and that the agent used it unchanged.</td></tr><tr><td>The action UploadFile cannot be selected for an action</td><td>OOTB scripts cannot be actions. Duplicate UploadFile and save the copy as UploadFileToWarRoom (step 2), then wrap the copy.</td></tr><tr><td>A PDF takes minutes or times out on first use</td><td>The demisto/chromium image was still pulling. Run the GeneratePDF warm-up command in your playground (step 2) and retry.</td></tr><tr><td>Create File says GeneratePDF returned no file</td><td>GeneratePDF is not imported, or not on the demisto/chromium image. Import GeneratePDF.yml (step 2).</td></tr><tr><td>The analyst cannot find the file</td><td>The agent stopped after Cortex - Create File; the file only exists in the chat run until Cortex - Upload File To War Room copies it. Check both action descriptions were pasted in full.</td></tr><tr><td>A walkthrough or flowchart is one straight line, or a branch to several tasks connects only the first</td><td>The agent ordered tasks by list position or misread Next. Check the Flows and diagrams block is in the Guidelines and the Search Playbooks description was pasted in full; re-import SearchTenantPlaybooks (Next uses &quot;-&gt; (1, 3)&quot; for several targets, and there is no Step field).</td></tr><tr><td>Next, Description or OnError come back empty</td><td>An old SearchTenantPlaybooks / PlaybookTaskFinder is imported (it read the exported-YAML keys, the API uses nextTasks / comment). Re-import both scripts from the Automations repo.</td></tr><tr><td>A file shows literal \n and \&quot; or &quot;The diagram could not be drawn&quot;</td><td>The agent sent the content JSON-escaped, or broke a Mermaid rule (empty label, \&quot; in a label). Re-import CreateFile (it unescapes and repairs Mermaid, Unescape=auto) and check the Mermaid rules are in the Guidelines.</td></tr><tr><td>The agent makes a PDF nobody asked for, or a flowchart PDF runs over several pages</td><td>The Guidelines must have the &quot;File formats&quot; block and the Create File description must be pasted in full (html, or html + .mmd for flowcharts, by default; pdf only when asked by name). A wide flowchart is meant to be viewed as the .html file.</td></tr><tr><td>A flowchart .html file shows &quot;The diagram could not be drawn&quot; in the browser</td><td>The analyst&#x27;s browser could not reach cdn.jsdelivr.net (the Mermaid library), or the Mermaid is invalid. Paste the .mmd into mermaid.live to check it; re-import CreateFile (it repairs single-quoted and empty labels).</td></tr><tr><td>A flowchart PDF is blank where the chart should be</td><td>The agent wrote HTML that draws with JavaScript; scripts are removed for PDF. The Guidelines and Create File description must say flowcharts are Mermaid.</td></tr><tr><td>Search, export or upload fails with an instance error</td><td>The UsingInstance default (Core REST API_instance_1) does not match this tenant&#x27;s Core REST API instance name. Update the script argument default (step 1). UploadFileToWarRoom uses the Core REST API instance too; with several instances set its using argument default to the right one.</td></tr><tr><td>The agent picks the wrong action</td><td>The action names in the agent description must match the actions exactly; tighten the two descriptions&#x27; &#x27;Do NOT use&#x27; lines.</td></tr><tr><td>A script action times out on first use</td><td>The image was still pulling: run the warm-up command in the playground (step 2).</td></tr><tr><td>An action is missing from the agent&#x27;s choices</td><td>It was created but not attached (step 6), or your role cannot use it.</td></tr></tbody></table><details><summary>Build warnings to review</summary><ul><li>[Cortex - Search Playbooks] exposes 25 inputs -- list only the ones the agent needs under inputs:</li><li>[Cortex - Upload File To War Room] declares no outputs -- the agent can only read what an action puts in context. Return context outputs; a file-creating action must declare File.EntryID (and File.Name...) so the agent can pass it to an upload action (duplicate of UploadFile). Fine for an upload action whose result is just a confirmation</li></ul></details></section>
+</div>
+<div class="allset" id="allset" role="status" aria-live="polite">
+  <div class="big" aria-hidden="true">&#127881; &#128640; &#9989;</div>
+  <h2>You're all set!</h2>
+  <p><strong>Playbook Explorer</strong> is set up and tested in XSIAM. Go ask it something &#128075;</p>
+  <button type="button" id="allset-close">Nice</button>
+</div>
+<script>
+(function () {
+  var KEY = "setup-doc:playbook-explorer";
+  function load() { try { return JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { return {}; } }
+  function save(s) { try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) {} }
+  var state = load();
+  var boxes = document.querySelectorAll("input[type=checkbox]");
+  var banner = document.getElementById("allset"), progress = document.getElementById("progress");
+  var dismissed = false;
+  function checkAll(announce) {
+    var done = 0;
+    boxes.forEach(function (b) { if (b.checked) done++; });
+    progress.textContent = done + " of " + boxes.length + " checks done";
+    var all = boxes.length > 0 && done === boxes.length;
+    if (!all) dismissed = false;
+    banner.classList.toggle("show", all && announce && !dismissed);
+  }
+  boxes.forEach(function (b, i) {
+    var id = b.dataset.step || ("c" + i);
+    b.checked = !!state[id];
+    var sync = function () { var s = b.closest(".step"); if (b.dataset.step && s) s.classList.toggle("is-done", b.checked); };
+    sync();
+    b.addEventListener("change", function () { state[id] = b.checked; save(state); sync(); checkAll(true); });
+  });
+  checkAll(false);  // restore progress quietly on reload; celebrate only when the last box gets ticked
+  document.getElementById("allset-close").addEventListener("click", function () {
+    dismissed = true; banner.classList.remove("show");
+  });
+  document.getElementById("reset").addEventListener("click", function () {
+    state = {}; save(state); boxes.forEach(function (b) { b.checked = false; var s = b.closest(".step"); if (s) s.classList.remove("is-done"); });
+    checkAll(false);
+  });
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var text = btn.parentNode.querySelector("code").innerText;
+      var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1200); };
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, function () {});
+    });
+  });
+  document.querySelectorAll("table").forEach(function (t) {
+    if (!t.parentNode.classList.contains("table-scroll")) { var d = document.createElement("div"); d.className = "table-scroll";
+      t.parentNode.insertBefore(d, t); d.appendChild(t); }
+  });
+})();
+</script>
+</body></html>
